@@ -67,16 +67,23 @@ export default function App() {
   // 1. Initialize Auth, Directories and Crypto Engines
   useEffect(() => {
     async function init() {
-      // Auto-load or provision initial account if first run
-      let currentAcc = authService.getAccount();
-      if (!currentAcc) {
-        currentAcc = await authService.ensureInitialAccount();
+      // Auto-load vault if user has an existing account in this browser
+      const currentAcc = authService.getAccount();
+      if (currentAcc) {
+        setAccount(currentAcc);
+        setIsLocked(authService.isAppLocked());
+        // Auto-register current device hardware & IP
+        await authService.ensureCurrentDeviceRegistered();
+        identityManager.syncUserProfile({
+          userId: currentAcc.id,
+          fullName: currentAcc.fullName,
+          avatarUrl: currentAcc.avatarUrl,
+        });
+      } else {
+        setAccount(null);
+        setIsLocked(false);
+        setAuthModalInitialMode('login');
       }
-      setAccount(currentAcc);
-      setIsLocked(authService.isAppLocked());
-
-      // Auto-register current device hardware & IP
-      await authService.ensureCurrentDeviceRegistered();
 
       // Initialize cryptographic keys and Double Ratchet channels
       await identityManager.initializeDefaultIdentities();
@@ -161,20 +168,6 @@ export default function App() {
     setForceUpdate((prev) => prev + 1);
   }, []);
 
-  // Sending messages for direct peer chat
-  const handleSendMessage = useCallback(
-    async (content: string, media?: EncryptedMediaPayload) => {
-      await identityManager.sendMessageFromDevice(
-        activeDeviceId,
-        peerDeviceId,
-        content,
-        media
-      );
-      setForceUpdate((prev) => prev + 1);
-    },
-    [activeDeviceId, peerDeviceId]
-  );
-
   // Peer Simulation: lets Elena, Marcus, Sarah, or Alex advance Double Ratchet and reply
   const handleTriggerSimulatePeer = useCallback(
     async (targetPeerDeviceId: string) => {
@@ -186,7 +179,7 @@ export default function App() {
           'Forward secrecy verified. Next message uses a fresh DH ratchet pair.',
         ],
         dev_marcus_phone: [
-          'Acknowledged Ved. Blind store-and-forward relay is operational with automatic 24-hour ciphertext purge.',
+          'Acknowledged. Blind store-and-forward relay is operational with automatic 24-hour ciphertext purge.',
           'GrapheneOS hardware keystore verified. Zero-knowledge proof-of-work accepted.',
           'Double Ratchet forward secrecy is advancing smoothly.',
           'Zero-knowledge proof-of-work calibrated to difficulty 2.',
@@ -224,6 +217,25 @@ export default function App() {
     [activeDeviceId]
   );
 
+  // Sending messages for direct peer chat
+  const handleSendMessage = useCallback(
+    async (content: string, media?: EncryptedMediaPayload) => {
+      await identityManager.sendMessageFromDevice(
+        activeDeviceId,
+        peerDeviceId,
+        content,
+        media
+      );
+      setForceUpdate((prev) => prev + 1);
+
+      // Auto-trigger peer response simulation after 700ms so chat feels responsive & alive
+      setTimeout(() => {
+        handleTriggerSimulatePeer(peerDeviceId);
+      }, 700);
+    },
+    [activeDeviceId, peerDeviceId, handleTriggerSimulatePeer]
+  );
+
   const handleLockApp = useCallback(() => {
     authService.lockApp();
   }, []);
@@ -242,10 +254,25 @@ export default function App() {
     setShowAuthModal(true);
   }, []);
 
+  const handleLogout = useCallback(() => {
+    authService.logoutAccount();
+    setAccount(null);
+    setIsLocked(false);
+    setAuthModalInitialMode('login');
+    setShowAuthModal(true);
+    setIsSettingsOpen(false);
+    setForceUpdate((prev) => prev + 1);
+  }, []);
+
   const handleAuthSuccess = useCallback((newAcc: UserAccount) => {
     setAccount({ ...newAcc });
     setShowAuthModal(false);
     setIsLocked(false);
+    identityManager.syncUserProfile({
+      userId: newAcc.id,
+      fullName: newAcc.fullName,
+      avatarUrl: newAcc.avatarUrl,
+    });
     setForceUpdate((prev) => prev + 1);
   }, []);
 
@@ -265,6 +292,19 @@ export default function App() {
           <span className="w-2 h-2 rounded-full bg-emerald-400 animate-ping" />
           <span>Web Crypto API & Device IP Telemetry Active</span>
         </div>
+      </div>
+    );
+  }
+
+  // If user has NO account in this browser, gate with Authentication first (no auto-opening other accounts!)
+  if (!account) {
+    return (
+      <div className="h-screen w-screen bg-[#07090e] flex items-center justify-center p-4">
+        <AuthModal
+          isOpen={true}
+          initialMode={authModalInitialMode || 'login'}
+          onSuccess={handleAuthSuccess}
+        />
       </div>
     );
   }
@@ -310,6 +350,7 @@ export default function App() {
         onOpenSettings={() => setIsSettingsOpen(true)}
         onToggleAudit={() => setIsInspectorOpen((prev) => !prev)}
         isAuditOpen={isInspectorOpen}
+        onLogout={handleLogout}
       />
 
       {/* Main Responsive Content Area */}
@@ -458,7 +499,16 @@ export default function App() {
         onAccountUpdated={() => {
           const updated = authService.getAccount();
           setAccount(updated ? { ...updated } : null);
+          if (updated) {
+            identityManager.syncUserProfile({
+              userId: updated.id,
+              fullName: updated.fullName,
+              avatarUrl: updated.avatarUrl,
+            });
+          }
+          setForceUpdate((prev) => prev + 1);
         }}
+        onLogout={handleLogout}
       />
     </div>
   );

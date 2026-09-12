@@ -68,7 +68,7 @@ class ClientIdentityManager {
       userId: 'usr_ved',
       username: 'ved_kanani',
       displayName: 'Ved Kanani',
-      avatar: 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=150&auto=format&fit=crop&q=80',
+      avatar: '', // Clean default, initials or custom uploaded photo will be rendered
       identityKey: {
         publicKeyHex: vedPhoneIdentity.identityKeyHex,
         fingerprint: `4920-1849-2938-1092-4820`,
@@ -274,6 +274,41 @@ class ClientIdentityManager {
     return this.initPromise;
   }
 
+  // Save all DM messages to localStorage
+  public saveDmMessages() {
+    try {
+      const data: Record<string, DecryptedMessage[]> = {};
+      for (const [deviceId, ctx] of this.clients.entries()) {
+        data[deviceId] = ctx.messages;
+      }
+      localStorage.setItem('nexus_dm_messages_v2', JSON.stringify(data));
+    } catch (e) {
+      console.error('Failed to save DM messages:', e);
+    }
+  }
+
+  // Load DM messages from localStorage
+  private loadDmMessages(): boolean {
+    try {
+      const saved = localStorage.getItem('nexus_dm_messages_v2');
+      if (saved) {
+        const data = JSON.parse(saved) as Record<string, DecryptedMessage[]>;
+        let hasAny = false;
+        for (const [deviceId, msgs] of Object.entries(data)) {
+          const ctx = this.clients.get(deviceId);
+          if (ctx && Array.isArray(msgs)) {
+            ctx.messages = msgs;
+            if (msgs.length > 0) hasAny = true;
+          }
+        }
+        return hasAny;
+      }
+    } catch (e) {
+      console.error('Failed to load DM messages:', e);
+    }
+    return false;
+  }
+
   // Pre-seed an initial verified E2EE message exchange
   private async setupInitialSessionAndSeedChat() {
     const vedContext = this.clients.get('dev_ved_phone')!;
@@ -309,18 +344,23 @@ class ClientIdentityManager {
     );
     elenaContext.sessions.set('dev_ved_phone', bobSession);
 
-    // Send first test messages with Elena
-    await this.sendMessageFromDevice(
-      'dev_ved_phone',
-      'dev_elena_desktop',
-      'Elena, verifying NEXUS Zero-Knowledge protocol handshake. No server can inspect this.'
-    );
+    // Check if saved DM messages already exist in localStorage
+    const hasExistingMessages = this.loadDmMessages();
 
-    await this.sendMessageFromDevice(
-      'dev_elena_desktop',
-      'dev_ved_phone',
-      'Handshake verified! X3DH completed and Double Ratchet is advancing smoothly. Forward secrecy active.'
-    );
+    // Send first test messages with Elena only if no existing messages
+    if (!hasExistingMessages) {
+      await this.sendMessageFromDevice(
+        'dev_ved_phone',
+        'dev_elena_desktop',
+        'Elena, verifying NEXUS Zero-Knowledge protocol handshake. No server can inspect this.'
+      );
+
+      await this.sendMessageFromDevice(
+        'dev_elena_desktop',
+        'dev_ved_phone',
+        'Handshake verified! X3DH completed and Double Ratchet is advancing smoothly. Forward secrecy active.'
+      );
+    }
 
     // Also establish session with Dr. Marcus Vance
     const marcusBundle = zkRelay.getPreKeyBundle('dev_marcus_phone')!;
@@ -350,18 +390,6 @@ class ClientIdentityManager {
       marcusContext.localIdentity.signedPreKeyPrivateJwk
     );
     marcusContext.sessions.set('dev_ved_phone', bobMarcusSession);
-
-    await this.sendMessageFromDevice(
-      'dev_ved_phone',
-      'dev_marcus_phone',
-      'Dr. Vance, relay enclave connection initialized. Zero-knowledge proof-of-work difficulty level calibrated.'
-    );
-
-    await this.sendMessageFromDevice(
-      'dev_marcus_phone',
-      'dev_ved_phone',
-      'Acknowledged Ved. Blind store-and-forward relay is operational with automatic 24-hour ciphertext purge.'
-    );
 
     // Also establish session with Sarah Chen
     const sarahContext = this.clients.get('dev_sarah_laptop')!;
@@ -393,18 +421,6 @@ class ClientIdentityManager {
     );
     sarahContext.sessions.set('dev_ved_phone', bobSarahSession);
 
-    await this.sendMessageFromDevice(
-      'dev_ved_phone',
-      'dev_sarah_laptop',
-      'Sarah, hardware token authenticated on Framework 16 node. Ready for enclave coordination.'
-    );
-
-    await this.sendMessageFromDevice(
-      'dev_sarah_laptop',
-      'dev_ved_phone',
-      'Verified Ved! Firmware integrity verified. Forward secrecy ratchet in sync.'
-    );
-
     // Also establish session with Alex Rivera
     const alexContext = this.clients.get('dev_alex_workstation')!;
     const alexBundle = zkRelay.getPreKeyBundle('dev_alex_workstation')!;
@@ -435,21 +451,65 @@ class ClientIdentityManager {
     );
     alexContext.sessions.set('dev_ved_phone', bobAlexSession);
 
-    await this.sendMessageFromDevice(
-      'dev_ved_phone',
-      'dev_alex_workstation',
-      'Alex, Debian hardened enclave node connected. Zero-knowledge authentication confirmed.'
-    );
+    if (!hasExistingMessages) {
+      await this.sendMessageFromDevice(
+        'dev_ved_phone',
+        'dev_marcus_phone',
+        'Dr. Vance, relay enclave connection initialized. Zero-knowledge proof-of-work difficulty level calibrated.'
+      );
 
-    await this.sendMessageFromDevice(
-      'dev_alex_workstation',
-      'dev_ved_phone',
-      'Hardware isolated enclave operational. Constant-time operations active.'
-    );
+      await this.sendMessageFromDevice(
+        'dev_marcus_phone',
+        'dev_ved_phone',
+        'Acknowledged Ved. Blind store-and-forward relay is operational with automatic 24-hour ciphertext purge.'
+      );
+
+      await this.sendMessageFromDevice(
+        'dev_ved_phone',
+        'dev_sarah_laptop',
+        'Sarah, hardware token authenticated on Framework 16 node. Ready for enclave coordination.'
+      );
+
+      await this.sendMessageFromDevice(
+        'dev_sarah_laptop',
+        'dev_ved_phone',
+        'Verified Ved! Firmware integrity verified. Forward secrecy ratchet in sync.'
+      );
+
+      await this.sendMessageFromDevice(
+        'dev_ved_phone',
+        'dev_alex_workstation',
+        'Alex, Debian hardened enclave node connected. Zero-knowledge authentication confirmed.'
+      );
+
+      await this.sendMessageFromDevice(
+        'dev_alex_workstation',
+        'dev_ved_phone',
+        'Hardware isolated enclave operational. Constant-time operations active.'
+      );
+    }
   }
 
   public getActiveContext(): UserClientContext {
-    return this.clients.get(this.activeDeviceId)!;
+    const ctx = this.clients.get(this.activeDeviceId)!;
+    return {
+      ...ctx,
+      messages: [...ctx.messages],
+    };
+  }
+
+  public syncUserProfile(account: { userId?: string; fullName?: string; avatarUrl?: string }) {
+    for (const ctx of this.clients.values()) {
+      if (
+        ctx.localIdentity.deviceId === this.activeDeviceId ||
+        ctx.user.userId === 'usr_ved' ||
+        (account.userId && ctx.user.userId === account.userId)
+      ) {
+        if (account.fullName) ctx.user.displayName = account.fullName;
+        if (account.avatarUrl !== undefined) ctx.user.avatar = account.avatarUrl;
+      }
+    }
+    this.notifyMessageListeners(null as any);
   }
 
   public getContextByDeviceId(deviceId: string): UserClientContext | undefined {
@@ -558,7 +618,8 @@ class ClientIdentityManager {
       mediaAttachment,
     };
     if (!senderContext.messages.some((m) => m.id === envelope.envelopeId)) {
-      senderContext.messages.push(localMsg);
+      senderContext.messages = [...senderContext.messages, localMsg];
+      this.saveDmMessages();
       this.notifyMessageListeners(localMsg);
     }
 
@@ -642,7 +703,8 @@ class ClientIdentityManager {
         merkleVerified: isValidCid,
       };
 
-      recipientContext.messages.push(decryptedMsg);
+      recipientContext.messages = [...recipientContext.messages, decryptedMsg];
+      this.saveDmMessages();
       this.notifyMessageListeners(decryptedMsg);
 
       // Acknowledge receipt to purge from relay server (store-and-forward)
@@ -664,7 +726,8 @@ class ClientIdentityManager {
         merkleVerified: false,
       };
       if (!recipientContext.messages.some((m) => m.id === errorMsg.id)) {
-        recipientContext.messages.push(errorMsg);
+        recipientContext.messages = [...recipientContext.messages, errorMsg];
+        this.saveDmMessages();
         this.notifyMessageListeners(errorMsg);
       }
     }
@@ -733,6 +796,7 @@ class ClientIdentityManager {
     for (const ctx of this.clients.values()) {
       ctx.messages = ctx.messages.filter((m) => m.senderId !== 'SYSTEM_TAMPER_ALERT');
     }
+    this.saveDmMessages();
   }
 
   // Run a complete Merkle Chain validation on current messages

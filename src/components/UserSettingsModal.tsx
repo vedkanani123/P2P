@@ -25,14 +25,22 @@ import {
   Clock,
   Eye,
   EyeOff,
+  LogOut,
 } from 'lucide-react';
-import { authService, UserAccount, getUserInitials, downloadRecoveryKeyFile } from '../services/authService';
+import {
+  authService,
+  UserAccount,
+  getUserInitials,
+  downloadRecoveryKeyFile,
+  compressImageFile,
+} from '../services/authService';
 
 interface UserSettingsModalProps {
   isOpen: boolean;
   onClose: () => void;
   account: UserAccount | null;
   onAccountUpdated: () => void;
+  onLogout?: () => void;
 }
 
 const PRESET_AVATARS = [
@@ -48,6 +56,7 @@ export const UserSettingsModal: React.FC<UserSettingsModalProps> = ({
   onClose,
   account,
   onAccountUpdated,
+  onLogout,
 }) => {
   const [firstName, setFirstName] = useState(account?.firstName || 'Ved');
   const [lastName, setLastName] = useState(account?.lastName || 'Kanani');
@@ -61,7 +70,7 @@ export const UserSettingsModal: React.FC<UserSettingsModalProps> = ({
 
   const initials = getUserInitials(firstName, lastName);
 
-  const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
 
@@ -70,16 +79,16 @@ export const UserSettingsModal: React.FC<UserSettingsModalProps> = ({
       return;
     }
 
-    const reader = new FileReader();
-    reader.onload = () => {
-      const dataUrl = reader.result as string;
+    try {
+      const dataUrl = await compressImageFile(file);
       setAvatarUrl(dataUrl);
       authService.updateProfileAvatar(dataUrl);
       setFeedback('Profile picture updated successfully!');
       setTimeout(() => setFeedback(null), 3000);
       onAccountUpdated();
-    };
-    reader.readAsDataURL(file);
+    } catch {
+      setFeedback('Failed to process image. Please try another image.');
+    }
   };
 
   const handleRemoveAvatar = () => {
@@ -403,6 +412,37 @@ export const UserSettingsModal: React.FC<UserSettingsModalProps> = ({
             >
               <Download className="w-3.5 h-3.5 text-emerald-400" />
               <span>Download Master Recovery Key (.txt)</span>
+            </button>
+          </div>
+
+          {/* Sign Out & Device Vault Wipe */}
+          <div className="p-4 rounded-xl bg-rose-500/5 border border-rose-500/20 space-y-2.5">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2 text-xs font-semibold text-rose-300">
+                <LogOut className="w-4 h-4 text-rose-400" />
+                <span>Sign Out of this Browser</span>
+              </div>
+              <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-rose-500/20 text-rose-300 border border-rose-500/30">
+                Local Vault
+              </span>
+            </div>
+            <p className="text-[11px] text-zinc-400 leading-relaxed">
+              Signing out removes this account's encryption keys from this browser's local vault. You will need your master password or recovery phrase to sign back in.
+            </p>
+            <button
+              type="button"
+              onClick={() => {
+                onClose();
+                if (onLogout) {
+                  onLogout();
+                } else {
+                  authService.logoutAccount();
+                }
+              }}
+              className="w-full py-2 px-3 rounded-xl bg-rose-500/20 hover:bg-rose-500/30 border border-rose-500/40 text-rose-200 text-xs font-mono font-medium flex items-center justify-center gap-2 transition-colors"
+            >
+              <LogOut className="w-3.5 h-3.5 text-rose-400" />
+              <span>Sign Out & Clear Local Vault</span>
             </button>
           </div>
         </div>

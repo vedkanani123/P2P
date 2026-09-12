@@ -67,8 +67,23 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
   const [copiedCid, setCopiedCid] = useState<string | null>(null);
   const [uploadingMedia, setUploadingMedia] = useState(false);
   const [joinRequestMessage, setJoinRequestMessage] = useState<string | null>(null);
+  const [, setTick] = useState(0);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // Subscribe directly to message updates for instant 0ms latency rendering
+  useEffect(() => {
+    const unsub1 = identityManager.subscribeMessages(() => {
+      setTick((t) => t + 1);
+    });
+    const unsub2 = groupAndDirectoryService.subscribe(() => {
+      setTick((t) => t + 1);
+    });
+    return () => {
+      unsub1();
+      unsub2();
+    };
+  }, []);
 
   const currentUserId = account?.id || activeContext.user.userId;
   const currentUsername = account?.email.split('@')[0] || activeContext.user.username;
@@ -141,15 +156,16 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
   }, [peerDeviceId]);
 
   // ---------------------------------------------------------------------------
-  // 2. Filter Messages: Isolated by Peer or Group!
+  // 2. Filter Messages: Isolated by Peer or Group with instant live reactivity!
   // ---------------------------------------------------------------------------
-  const messages: DecryptedMessage[] = useMemo(() => {
+  const messages: DecryptedMessage[] = (() => {
     if (isGroupMode && activeGroup) {
       return groupAndDirectoryService.getGroupMessages(activeGroup.groupId);
     }
 
     // Filter messages for active peer only
-    const targetConvId = `conv_${[activeContext.localIdentity.deviceId, peerDeviceId].sort().join('_')}`;
+    const currentDevice = activeContext.localIdentity.deviceId;
+    const targetConvId = `conv_${[currentDevice, peerDeviceId].sort().join('_')}`;
     return activeContext.messages.filter((msg) => {
       // Exclude group messages in DM view
       if (msg.groupId) return false;
@@ -159,7 +175,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
         msg.senderId === 'SYSTEM_TAMPER_ALERT'
       );
     });
-  }, [isGroupMode, activeGroup, activeContext.messages, activeContext.localIdentity.deviceId, peerDeviceId]);
+  })();
 
   // Auto-scroll to bottom on new message
   useEffect(() => {
@@ -190,9 +206,11 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
           },
           text
         );
+        setTick((t) => t + 1);
       } else {
         // Send to direct peer
         await onSendMessage(text);
+        setTick((t) => t + 1);
       }
     } catch (err) {
       console.error('Send error:', err);
@@ -229,8 +247,10 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
           label,
           payload
         );
+        setTick((t) => t + 1);
       } else {
         await onSendMessage(label, payload);
+        setTick((t) => t + 1);
       }
     } catch (err) {
       console.error('Failed to chunk file:', err);

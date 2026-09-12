@@ -26,7 +26,7 @@ const BASE_NETWORK_USERS: UserDirectoryItem[] = [
     username: 'ved',
     displayName: 'Ved Kanani',
     role: 'Chief Systems Architect',
-    avatar: 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=150&auto=format&fit=crop&q=80',
+    avatar: '', // Clean default: initials VK or custom uploaded photo
     primaryDeviceId: 'dev_ved_phone',
     status: 'online',
     fingerprint: '4920-1849-2938-1092-4820',
@@ -288,21 +288,21 @@ class GroupAndDirectoryService {
   // User Directory & Search Methods
   // ---------------------------------------------------------------------------
 
-  public getNetworkUsers(registeredAccount?: { id: string; fullName: string; email: string } | null): UserDirectoryItem[] {
+  public getNetworkUsers(registeredAccount?: { id: string; fullName: string; email: string; avatarUrl?: string; status?: 'online' | 'idle' | 'offline' } | null): UserDirectoryItem[] {
     const list = [...BASE_NETWORK_USERS];
 
     if (registeredAccount) {
       const username = registeredAccount.email.split('@')[0];
-      const existingIdx = list.findIndex((u) => u.userId === registeredAccount.id || u.username === username);
+      const existingIdx = list.findIndex((u) => u.userId === registeredAccount.id || u.username === username || u.userId === 'usr_ved');
 
       const userItem: UserDirectoryItem = {
         userId: registeredAccount.id,
         username,
         displayName: registeredAccount.fullName,
         role: 'Verified Enclave User',
-        avatar: `https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=150&auto=format&fit=crop&q=80`,
+        avatar: registeredAccount.avatarUrl || '',
         primaryDeviceId: `dev_${username}_primary`,
-        status: 'online',
+        status: registeredAccount.status || 'online',
         fingerprint: '8821-4920-1928-3019-7712',
         bio: 'Self-sovereign cryptographic account holder.',
         isRegisteredUser: true,
@@ -320,7 +320,7 @@ class GroupAndDirectoryService {
 
   public searchUsersAndGroups(
     query: string,
-    currentAccount?: { id: string; fullName: string; email: string } | null
+    currentAccount?: { id: string; fullName: string; email: string; avatarUrl?: string; status?: 'online' | 'idle' | 'offline' } | null
   ): {
     users: UserDirectoryItem[];
     groups: GroupChat[];
@@ -658,7 +658,8 @@ class GroupAndDirectoryService {
   // ---------------------------------------------------------------------------
 
   public getGroupMessages(groupId: string): DecryptedMessage[] {
-    return this.groupMessages.get(groupId) || [];
+    const list = this.groupMessages.get(groupId) || [];
+    return [...list];
   }
 
   public sendGroupMessage(
@@ -703,8 +704,8 @@ class GroupAndDirectoryService {
       mediaAttachment,
     };
 
-    existingMsgs.push(newMsg);
-    this.groupMessages.set(groupId, existingMsgs);
+    const updatedMsgs = [...existingMsgs, newMsg];
+    this.groupMessages.set(groupId, updatedMsgs);
     this.saveGroupMessages();
 
     // Update group last message preview

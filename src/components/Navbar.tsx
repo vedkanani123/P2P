@@ -31,6 +31,7 @@ interface NavbarProps {
   onOpenSettings?: () => void;
   onToggleAudit: () => void;
   isAuditOpen: boolean;
+  onLogout?: () => void;
 }
 
 export const Navbar: React.FC<NavbarProps> = ({
@@ -44,6 +45,7 @@ export const Navbar: React.FC<NavbarProps> = ({
   onOpenSettings,
   onToggleAudit,
   isAuditOpen,
+  onLogout,
 }) => {
   const currentDevice = account?.devices?.find(
     (d) => d.deviceId === account.activeDeviceId
@@ -166,6 +168,15 @@ export const Navbar: React.FC<NavbarProps> = ({
               <span className="text-xs font-medium text-zinc-200 hidden lg:inline truncate max-w-[120px] group-hover:text-white">
                 {account.fullName}
               </span>
+            </button>
+
+            {/* Direct Logout Action */}
+            <button
+              onClick={onLogout}
+              className="p-1.5 rounded-lg bg-white/[0.04] hover:bg-rose-500/20 hover:text-rose-300 border border-white/[0.06] hover:border-rose-500/30 text-zinc-400 transition-colors"
+              title="Sign Out of this Device"
+            >
+              <LogOut className="w-3.5 h-3.5" />
             </button>
           </div>
         ) : (

@@ -90,6 +90,45 @@ export async function hashString(input: string, salt: string = ''): Promise<stri
   return hashArray.map((b) => b.toString(16).padStart(2, '0')).join('');
 }
 
+// Safely compress and resize user profile images to avoid localStorage quota overflow
+export function compressImageFile(file: File, maxDim = 256, quality = 0.82): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      const img = new Image();
+      img.onload = () => {
+        const canvas = document.createElement('canvas');
+        let width = img.width;
+        let height = img.height;
+        if (width > height) {
+          if (width > maxDim) {
+            height = Math.round((height * maxDim) / width);
+            width = maxDim;
+          }
+        } else {
+          if (height > maxDim) {
+            width = Math.round((width * maxDim) / height);
+            height = maxDim;
+          }
+        }
+        canvas.width = width;
+        canvas.height = height;
+        const ctx = canvas.getContext('2d');
+        if (!ctx) {
+          resolve(e.target?.result as string);
+          return;
+        }
+        ctx.drawImage(img, 0, 0, width, height);
+        resolve(canvas.toDataURL('image/jpeg', quality));
+      };
+      img.onerror = () => resolve(e.target?.result as string);
+      img.src = e.target?.result as string;
+    };
+    reader.onerror = reject;
+    reader.readAsDataURL(file);
+  });
+}
+
 // Generate 12 random words from dictionary using crypto.getRandomValues
 export function generate12WordRecoveryPhrase(): string {
   const words: string[] = [];
@@ -268,7 +307,8 @@ class AuthService {
       createdAt: Date.now(),
       devices: [device],
       activeDeviceId: device.deviceId,
-      avatarUrl: `https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=150&auto=format&fit=crop&q=80`,
+      avatarUrl: '', // Clean default: dual initials will be used until user uploads their custom photo
+      status: 'online',
     };
 
     this.currentAccount = newAccount;
@@ -441,7 +481,16 @@ class AuthService {
     this.notify();
   }
 
-  // Pre-seed default demo account if none exists, allowing instant testing while having complete registration
+  // Full sign out / switch account: wipes vault credentials from this browser
+  public logoutAccount(): void {
+    this.isLocked = true;
+    sessionStorage.removeItem(APP_LOCK_SESSION_KEY);
+    this.currentAccount = null;
+    localStorage.removeItem(STORAGE_KEY);
+    this.notify();
+  }
+
+  // Pre-seed default demo account when user explicitly clicks "Quick Demo Login"
   public async ensureInitialAccount(): Promise<UserAccount> {
     if (this.currentAccount) {
       return this.currentAccount;
