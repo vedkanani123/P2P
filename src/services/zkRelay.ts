@@ -28,6 +28,7 @@ class ZeroKnowledgeRelayService {
   private envelopeListeners = new Set<EnvelopeListener>();
   private wiretapListeners = new Set<WiretapListener>();
   private networkEventListeners = new Set<NetworkEventListener>();
+  private connectionListeners = new Set<() => void>();
 
   // WebSocket Connection
   private ws: WebSocket | null = null;
@@ -35,6 +36,7 @@ class ZeroKnowledgeRelayService {
   private currentDeviceId: string | null = null;
   private currentUserId: string | null = null;
   private reconnectTimer: any = null;
+  private pendingBroadcastQueue: Array<{ type: string; [key: string]: any }> = [];
 
   constructor() {
     // Initial fetch of wiretap logs
@@ -87,6 +89,23 @@ class ZeroKnowledgeRelayService {
             })
           );
         }
+
+        // Flush queued broadcast events
+        while (this.pendingBroadcastQueue.length > 0) {
+          const item = this.pendingBroadcastQueue.shift();
+          if (item && this.ws?.readyState === WebSocket.OPEN) {
+            this.ws.send(JSON.stringify(item));
+          }
+        }
+
+        // Notify connection listeners (triggers peer discovery handshake immediately)
+        this.connectionListeners.forEach((listener) => {
+          try {
+            listener();
+          } catch (e) {
+            console.error('[NEXUS Relay] Error in connection listener:', e);
+          }
+        });
       };
 
       this.ws.onmessage = async (event) => {
@@ -300,6 +319,31 @@ class ZeroKnowledgeRelayService {
   public subscribeNetworkEvents(listener: NetworkEventListener): () => void {
     this.networkEventListeners.add(listener);
     return () => this.networkEventListeners.delete(listener);
+  }
+
+  // Hook into WebSocket connection lifecycle
+  public onConnected(callback: () => void): () => void {
+    this.connectionListeners.add(callback);
+    if (this.isConnected()) {
+      setTimeout(callback, 0);
+    }
+    return () => this.connectionListeners.delete(callback);
+  }
+
+  public isConnected(): boolean {
+    return this.ws !== null && this.ws.readyState === WebSocket.OPEN;
+  }
+
+  // Force broadcast a network event (e.g. Peer Discovery handshake) across all active nodes
+  public broadcastNetworkEvent(event: { type: string; [key: string]: any }): boolean {
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify(event));
+      return true;
+    } else {
+      // Buffer event to fire immediately once WebSocket connection completes
+      this.pendingBroadcastQueue.push(event);
+      return false;
+    }
   }
 
   // SIMULATE ATTACK: Tamper with an envelope in the relay store to demonstrate cryptographic failure

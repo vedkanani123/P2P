@@ -282,6 +282,23 @@ app.post('/api/register', (req, res) => {
     user: sanitizeUser(userRecord),
   });
 
+  // Peer Discovery broadcast to all nodes immediately
+  broadcast({
+    type: 'peer:discovery_announce',
+    handshakeId: `ann_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+    senderDeviceId: deviceId || `dev_${userId}`,
+    senderUserId: userId,
+    directoryMetadata: sanitizeUser(userRecord),
+    publicPreKeyBundle: userRecord.preKeyBundle || {
+      userId,
+      deviceId: deviceId || `dev_${userId}`,
+      identityPublicKeyHex: userRecord.devices[0]?.devicePublicKeyHex || userId,
+      signedPreKeyHex: userRecord.devices[0]?.signedPreKeyHex || '',
+      signedPreKeySignature: '',
+    },
+    timestamp: Date.now(),
+  });
+
   return res.json({
     success: true,
     user: sanitizeUser(userRecord),
@@ -414,6 +431,33 @@ app.post('/api/users/update-profile', (req, res) => {
   });
 
   return res.json({ success: true, user: sanitizeUser(user) });
+});
+
+// ActiveDirectoryState Snapshot Endpoint
+app.get('/api/directory-state', (req, res) => {
+  const peers = Object.values(vault.users).map((u) => {
+    const sanitized = sanitizeUser(u);
+    const bundle = u.preKeyBundle || {
+      userId: u.userId,
+      deviceId: u.devices[0]?.deviceId || `dev_${u.userId}`,
+      identityPublicKeyHex: u.devices[0]?.devicePublicKeyHex || u.userId,
+      signedPreKeyHex: u.devices[0]?.signedPreKeyHex || '',
+      signedPreKeySignature: '',
+    };
+    return {
+      metadata: sanitized,
+      preKeyBundle: bundle,
+      deviceId: u.devices[0]?.deviceId || `dev_${u.userId}`,
+      status: u.status || 'online',
+    };
+  });
+
+  return res.json({
+    type: 'ActiveDirectoryState',
+    timestamp: Date.now(),
+    peers,
+    activeDeviceCount: peers.length,
+  });
 });
 
 // PreKey Bundle Management for X3DH
@@ -739,6 +783,113 @@ wss.on('connection', (ws: WebSocket) => {
             );
             persistVault();
           }
+          break;
+        }
+
+        case 'peer:discovery_request': {
+          const { senderDeviceId, senderUserId, directoryMetadata, publicPreKeyBundle, handshakeId } = data;
+
+          // Update vault record for sender if present
+          if (senderUserId && vault.users[senderUserId]) {
+            const user = vault.users[senderUserId];
+            user.status = 'online';
+            if (publicPreKeyBundle) {
+              user.preKeyBundle = publicPreKeyBundle;
+            }
+            if (directoryMetadata?.displayName) {
+              user.fullName = directoryMetadata.displayName;
+            }
+            if (directoryMetadata?.avatar) {
+              user.avatarUrl = directoryMetadata.avatar;
+            }
+            persistVault();
+          }
+
+          // Broadcast discovery request to all other connected active nodes in real-time
+          const broadcastPayload = JSON.stringify(data);
+          allClients.forEach((client) => {
+            if (client !== ws && client.readyState === WebSocket.OPEN) {
+              client.send(broadcastPayload);
+            }
+          });
+
+          // Immediate response to requester with all currently known active nodes and public keys
+          const knownPeers = Object.values(vault.users).map((u) => {
+            const sanitized = sanitizeUser(u);
+            const bundle = u.preKeyBundle || {
+              userId: u.userId,
+              deviceId: u.devices[0]?.deviceId || `dev_${u.userId}`,
+              identityPublicKeyHex: u.devices[0]?.devicePublicKeyHex || u.userId,
+              signedPreKeyHex: u.devices[0]?.signedPreKeyHex || '',
+              signedPreKeySignature: '',
+            };
+            return {
+              metadata: sanitized,
+              preKeyBundle: bundle,
+            };
+          });
+
+          ws.send(
+            JSON.stringify({
+              type: 'peer:discovery_initial_sync',
+              handshakeId,
+              peers: knownPeers,
+              timestamp: Date.now(),
+            })
+          );
+          break;
+        }
+
+        case 'peer:discovery_response': {
+          const { targetDeviceId } = data;
+          if (targetDeviceId) {
+            const delivered = sendToDevice(targetDeviceId, data);
+            if (!delivered) {
+              const payload = JSON.stringify(data);
+              allClients.forEach((client) => {
+                if (client !== ws && client.readyState === WebSocket.OPEN) {
+                  client.send(payload);
+                }
+              });
+            }
+          } else {
+            const payload = JSON.stringify(data);
+            allClients.forEach((client) => {
+              if (client !== ws && client.readyState === WebSocket.OPEN) {
+                client.send(payload);
+              }
+            });
+          }
+          break;
+        }
+
+        case 'get_active_directory_state':
+        case 'poll:active_directory_state': {
+          const peers = Object.values(vault.users).map((u) => {
+            const sanitized = sanitizeUser(u);
+            const bundle = u.preKeyBundle || {
+              userId: u.userId,
+              deviceId: u.devices[0]?.deviceId || `dev_${u.userId}`,
+              identityPublicKeyHex: u.devices[0]?.devicePublicKeyHex || u.userId,
+              signedPreKeyHex: u.devices[0]?.signedPreKeyHex || '',
+              signedPreKeySignature: '',
+            };
+            return {
+              metadata: sanitized,
+              preKeyBundle: bundle,
+              deviceId: u.devices[0]?.deviceId || `dev_${u.userId}`,
+              status: u.status || 'online',
+            };
+          });
+
+          ws.send(
+            JSON.stringify({
+              type: 'ActiveDirectoryState',
+              timestamp: Date.now(),
+              peers,
+              activeDeviceCount: peers.length,
+            })
+          );
           break;
         }
 

@@ -184,3 +184,32 @@ export interface ProofOfWorkResult {
   difficulty: number;
   timeMs: number;
 }
+
+// Peer Discovery Handshake Protocol
+export interface PeerDiscoveryMetadata {
+  userId: string;
+  username: string;
+  displayName: string;
+  avatar: string;
+  role: string;
+  primaryDeviceId: string;
+  status: 'online' | 'offline' | 'idle';
+  fingerprint: string;
+  bio?: string;
+  isRegisteredUser?: boolean;
+}
+
+export interface PeerDiscoveryHandshakeEvent {
+  type: 'peer:discovery_request' | 'peer:discovery_response' | 'peer:discovery_announce' | 'peer:discovery_initial_sync';
+  handshakeId: string;
+  senderDeviceId: string;
+  senderUserId: string;
+  targetDeviceId?: string;
+  directoryMetadata: PeerDiscoveryMetadata;
+  publicPreKeyBundle: PreKeyBundle;
+  timestamp: number;
+  peers?: Array<{
+    metadata: PeerDiscoveryMetadata;
+    preKeyBundle: PreKeyBundle;
+  }>;
+}

@@ -32,6 +32,8 @@ import { AuthModal } from './components/AuthModal';
 import { CreateGroupModal } from './components/CreateGroupModal';
 import { GroupInfoModal } from './components/GroupInfoModal';
 import { UserSettingsModal } from './components/UserSettingsModal';
+import { SessionVerificationModal } from './components/SessionVerificationModal';
+import { peerSyncManager } from './services/peerSyncManager';
 import { DecryptedMessage, EncryptedMediaPayload } from './types';
 import { Lock } from 'lucide-react';
 
@@ -74,17 +76,21 @@ export default function App() {
         setIsLocked(authService.isAppLocked());
         setActiveDeviceId(currentAcc.activeDeviceId);
 
-        // Auto-register current device hardware & IP
-        await authService.ensureCurrentDeviceRegistered();
+        // Verify device hardware & IP fingerprint headers during initial account load
+        const isDeviceVerified = await authService.verifyInitialDeviceFingerprint();
+        if (isDeviceVerified) {
+          // Auto-register current device hardware & IP
+          await authService.ensureCurrentDeviceRegistered();
 
-        // Initialize user's real cryptographic keys and WebSocket relay
-        await identityManager.initForUser(currentAcc);
+          // Initialize user's real cryptographic keys and WebSocket relay
+          await identityManager.initForUser(currentAcc);
 
-        const peers = identityManager.getNetworkUsers().filter((u) => u.userId !== currentAcc.id);
-        if (peers.length > 0) {
-          setPeerDeviceId(peers[0].primaryDeviceId);
-        } else {
-          setPeerDeviceId('');
+          const peers = identityManager.getNetworkUsers().filter((u) => u.userId !== currentAcc.id);
+          if (peers.length > 0) {
+            setPeerDeviceId(peers[0].primaryDeviceId);
+          } else {
+            setPeerDeviceId('');
+          }
         }
       } else {
         setAccount(null);
@@ -104,18 +110,10 @@ export default function App() {
       setForceUpdate((prev) => prev + 1);
     });
 
-    // Subscribe to real-time message changes
-    const unsubMsg = identityManager.subscribeMessages(() => {
-      setForceUpdate((prev) => prev + 1);
-    });
-
-    // Subscribe to directory changes (when other devices/users register)
-    const unsubDir = identityManager.subscribeDirectory(() => {
-      setForceUpdate((prev) => prev + 1);
-    });
-
-    // Subscribe to group state updates
-    const unsubGroups = groupAndDirectoryService.subscribe(() => {
+    // High-performance batched synchronization using requestAnimationFrame
+    // Wraps message subscriptions, group subscriptions, and directory updates
+    // in a single atomic UI update cycle, completely eliminating redundant re-renders
+    const unsubSync = peerSyncManager.subscribe(() => {
       setForceUpdate((prev) => prev + 1);
     });
 
@@ -125,9 +123,7 @@ export default function App() {
 
     return () => {
       unsubAuth();
-      unsubMsg();
-      unsubDir();
-      unsubGroups();
+      unsubSync();
       unsubWiretap();
     };
   }, []);
@@ -232,6 +228,24 @@ export default function App() {
     setForceUpdate((prev) => prev + 1);
   }, []);
 
+  const handleSessionVerified = useCallback(async () => {
+    const currentAcc = authService.getAccount();
+    if (currentAcc) {
+      setAccount({ ...currentAcc });
+      setIsLocked(authService.isAppLocked());
+      setActiveDeviceId(currentAcc.activeDeviceId);
+      await authService.ensureCurrentDeviceRegistered();
+      await identityManager.initForUser(currentAcc);
+      const peers = identityManager.getNetworkUsers().filter((u) => u.userId !== currentAcc.id);
+      if (peers.length > 0) {
+        setPeerDeviceId(peers[0].primaryDeviceId);
+      } else {
+        setPeerDeviceId('');
+      }
+      setForceUpdate((prev) => prev + 1);
+    }
+  }, []);
+
   if (!isReady) {
     return (
       <div className="min-h-screen bg-[#07090e] flex flex-col items-center justify-center p-4 text-zinc-300 font-sans select-none">
@@ -261,6 +275,27 @@ export default function App() {
           initialMode={authModalInitialMode || 'login'}
           onSuccess={handleAuthSuccess}
         />
+      </div>
+    );
+  }
+
+  // Ephemeral Session Verification: Hardware / IP signature mismatch detected
+  if (account && authService.isSessionVerificationRequired()) {
+    return (
+      <div className="h-screen w-screen bg-[#07090e]">
+        <SessionVerificationModal
+          account={account}
+          onVerified={handleSessionVerified}
+          onSwitchAccount={handleSwitchAccount}
+        />
+        {showAuthModal && (
+          <AuthModal
+            isOpen={showAuthModal}
+            initialMode={authModalInitialMode}
+            onClose={() => setShowAuthModal(false)}
+            onSuccess={handleAuthSuccess}
+          />
+        )}
       </div>
     );
   }
@@ -309,13 +344,20 @@ export default function App() {
         onLogout={handleLogout}
       />
 
-      {/* Main Responsive Content Area */}
-      <div className="flex-1 flex overflow-hidden relative">
-        {/* Sidebar: Visible on Desktop, or on Mobile when !showMobileChat */}
+      {/* Main Responsive Content Area with Defensive Container Checks */}
+      <div
+        id="nexus-main-layout-container"
+        className="flex-1 flex overflow-hidden relative w-full h-full"
+      >
+        {/* Defensive Container Check: Sidebar is strictly rendered via CSS class conditionals */}
         <div
-          className={`w-full md:w-80 h-full shrink-0 ${
-            showMobileChat ? 'hidden md:flex' : 'flex'
+          id="nexus-sidebar-container"
+          className={`h-full shrink-0 transition-all duration-150 ${
+            showMobileChat
+              ? 'hidden md:flex md:w-80 md:flex-col'
+              : 'flex flex-col w-full md:w-80'
           }`}
+          style={{ maxWidth: showMobileChat ? undefined : '100%' }}
         >
           <Sidebar
             activeContext={activeContext}
@@ -335,10 +377,13 @@ export default function App() {
           />
         </div>
 
-        {/* Center Panel: Production E2EE Chat Area: Visible on Desktop, or on Mobile when showMobileChat */}
+        {/* Defensive Container Check: ChatArea is strictly rendered via CSS class conditionals, zero overlap */}
         <div
-          className={`flex-1 h-full min-w-0 ${
-            !showMobileChat ? 'hidden md:flex' : 'flex'
+          id="nexus-chat-area-container"
+          className={`h-full min-w-0 flex-1 transition-all duration-150 ${
+            !showMobileChat
+              ? 'hidden md:flex md:flex-col'
+              : 'flex flex-col w-full'
           }`}
         >
           <ChatArea

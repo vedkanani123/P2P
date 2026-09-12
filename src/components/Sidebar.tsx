@@ -7,7 +7,7 @@
  * - Live hardware enclave & IP telemetry
  */
 
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useEffect } from 'react';
 import {
   ShieldCheck,
   CheckCircle2,
@@ -24,8 +24,9 @@ import {
   Clock,
   Sparkles,
   ArrowRight,
+  RefreshCw,
 } from 'lucide-react';
-import { UserClientContext } from '../services/identityManager';
+import { UserClientContext, identityManager } from '../services/identityManager';
 import { UserAccount, getUserInitials } from '../services/authService';
 import { groupAndDirectoryService } from '../services/groupAndDirectoryService';
 import { UserDirectoryItem, GroupChat } from '../types';
@@ -59,6 +60,15 @@ export const Sidebar: React.FC<SidebarProps> = ({
 }) => {
   const [searchQuery, setSearchQuery] = useState('');
   const [categoryFilter, setCategoryFilter] = useState<'all' | 'dms' | 'groups'>('all');
+  const [peerDiscoveryState, setPeerDiscoveryState] = useState(
+    identityManager.peerDiscovery.getState()
+  );
+
+  useEffect(() => {
+    return identityManager.peerDiscovery.subscribe((state) => {
+      setPeerDiscoveryState(state);
+    });
+  }, []);
 
   const currentUserId = account?.id || activeContext.user.userId;
   const displayName = account?.fullName || activeContext.user.displayName;
@@ -152,6 +162,39 @@ export const Sidebar: React.FC<SidebarProps> = ({
             </span>
           </div>
         )}
+
+        {/* Live Peer Discovery Handshake Status Strip */}
+        <div className="mt-2.5 p-1.5 px-2 rounded-lg bg-emerald-950/20 border border-emerald-500/20 flex items-center justify-between">
+          <div className="flex items-center gap-1.5 min-w-0">
+            <span
+              className={`w-1.5 h-1.5 rounded-full ${
+                peerDiscoveryState.isBroadcasting
+                  ? 'bg-amber-400 animate-ping'
+                  : 'bg-emerald-400'
+              }`}
+            />
+            <span className="text-[10px] font-mono text-zinc-300 truncate">
+              {peerDiscoveryState.isBroadcasting
+                ? 'Handshake Broadcasting...'
+                : `Peer Discovery Active (${allUsers.length} peer${allUsers.length === 1 ? '' : 's'})`}
+            </span>
+          </div>
+          <button
+            onClick={() => identityManager.triggerPeerDiscovery()}
+            disabled={peerDiscoveryState.isBroadcasting}
+            className="px-1.5 py-0.5 rounded bg-white/[0.06] hover:bg-emerald-500/25 text-zinc-400 hover:text-emerald-300 border border-white/[0.08] transition-colors flex items-center gap-1 text-[9px] font-mono shrink-0 ml-1.5"
+            title="Force real-time Peer Discovery handshake broadcast to exchange keys with all nodes"
+          >
+            <Radio
+              className={`w-2.5 h-2.5 ${
+                peerDiscoveryState.isBroadcasting
+                  ? 'text-amber-400 animate-spin'
+                  : 'text-emerald-400'
+              }`}
+            />
+            <span>{peerDiscoveryState.isBroadcasting ? 'Syncing' : 'Sync'}</span>
+          </button>
+        </div>
       </div>
 
       {/* Global Real-Time Search Bar */}

@@ -28,6 +28,9 @@ import {
   RelayEnvelope,
   EncryptedMediaPayload,
   UserDirectoryItem,
+  PreKeyBundle,
+  PeerDiscoveryMetadata,
+  PeerDiscoveryHandshakeEvent,
 } from '../types';
 
 export interface UserClientContext {
@@ -36,6 +39,266 @@ export interface UserClientContext {
   sessions: Map<string, ActiveRatchetSession>; // key = peerDeviceId
   messages: DecryptedMessage[];
   lastCid: string;
+}
+
+export interface PeerDiscoveryState {
+  isBroadcasting: boolean;
+  lastBroadcastAt: number | null;
+  totalPeersDiscovered: number;
+  lastDiscoveredPeerName?: string;
+  activeHandshakeId?: string;
+}
+
+/**
+ * Peer Discovery Handshake Service
+ * Forces real-time broadcast to all active nodes to exchange public key bundles
+ * and directory metadata, ensuring newly joined accounts are immediately reachable
+ * by the entire network without requiring a page refresh.
+ */
+export class PeerDiscoveryService {
+  private identityManager: ClientIdentityManager;
+  private state: PeerDiscoveryState = {
+    isBroadcasting: false,
+    lastBroadcastAt: null,
+    totalPeersDiscovered: 0,
+  };
+  private stateListeners = new Set<(state: PeerDiscoveryState) => void>();
+
+  constructor(manager: ClientIdentityManager) {
+    this.identityManager = manager;
+  }
+
+  public getState(): PeerDiscoveryState {
+    return { ...this.state };
+  }
+
+  public subscribe(listener: (state: PeerDiscoveryState) => void): () => void {
+    this.stateListeners.add(listener);
+    listener(this.getState());
+    return () => this.stateListeners.delete(listener);
+  }
+
+  private notify() {
+    const s = this.getState();
+    this.stateListeners.forEach((l) => {
+      try {
+        l(s);
+      } catch (err) {
+        console.error('[PeerDiscovery] Error in state listener:', err);
+      }
+    });
+  }
+
+  /**
+   * Forces a Peer Discovery handshake broadcast across all active nodes in real-time.
+   * Exchanges public key bundles and directory metadata with every connected node.
+   */
+  public async triggerHandshake(force: boolean = false): Promise<void> {
+    const now = Date.now();
+    if (!force && this.state.lastBroadcastAt && now - this.state.lastBroadcastAt < 1500) {
+      return;
+    }
+
+    const activeCtx = this.identityManager.getActiveContext();
+    if (!activeCtx || !activeCtx.localIdentity) {
+      return;
+    }
+
+    this.state.isBroadcasting = true;
+    this.state.lastBroadcastAt = now;
+    const handshakeId = `hs_${now}_${Math.random().toString(36).substring(2, 7)}`;
+    this.state.activeHandshakeId = handshakeId;
+    this.notify();
+
+    // 1. Build public PreKeyBundle from local cryptographic identity
+    const publicPreKeyBundle = createPublicPreKeyBundle(activeCtx.localIdentity);
+    zkRelay.registerPreKeyBundle(publicPreKeyBundle);
+
+    // 2. Build current node's directory metadata
+    const activeDeviceId = this.identityManager.getActiveDeviceId() || `dev_${activeCtx.user.userId}`;
+    const directoryMetadata: PeerDiscoveryMetadata = {
+      userId: activeCtx.user.userId,
+      username: activeCtx.user.username,
+      displayName: activeCtx.user.displayName,
+      avatar: activeCtx.user.avatar,
+      role: 'Verified Peer',
+      primaryDeviceId: activeDeviceId,
+      status: 'online',
+      fingerprint: activeCtx.user.identityKey.fingerprint || activeCtx.user.userId,
+      bio: `Hardware Enclave Node @${activeCtx.user.username}`,
+      isRegisteredUser: true,
+    };
+
+    // 3. Formulate the broadcast discovery request
+    const discoveryRequest: PeerDiscoveryHandshakeEvent = {
+      type: 'peer:discovery_request',
+      handshakeId,
+      senderDeviceId: activeDeviceId,
+      senderUserId: activeCtx.user.userId,
+      directoryMetadata,
+      publicPreKeyBundle,
+      timestamp: now,
+    };
+
+    console.log(`[PeerDiscovery] 📡 Forced handshake broadcast sent [${handshakeId}] from node ${activeDeviceId}`);
+
+    // 4. Force broadcast across WebSocket relay to all active nodes
+    zkRelay.broadcastNetworkEvent(discoveryRequest);
+
+    // Also trigger server directory sync in background
+    this.identityManager.fetchNetworkUsers().catch(() => {});
+
+    setTimeout(() => {
+      this.state.isBroadcasting = false;
+      this.notify();
+    }, 1200);
+  }
+
+  /**
+   * Handle incoming peer discovery events (requests, responses, announces, initial sync)
+   */
+  public handleDiscoveryEvent(event: any): void {
+    if (!event || !event.type) return;
+
+    const myDeviceId = this.identityManager.getActiveDeviceId();
+    const myUserId = this.identityManager.getActiveUserId();
+
+    switch (event.type) {
+      case 'peer:discovery_request': {
+        const { senderDeviceId, senderUserId, directoryMetadata, publicPreKeyBundle, handshakeId } = event;
+
+        // Skip self
+        if (senderDeviceId === myDeviceId || senderUserId === myUserId) {
+          return;
+        }
+
+        console.log(`[PeerDiscovery] 📥 Discovered peer request from @${directoryMetadata?.username} (${senderDeviceId})`);
+
+        if (directoryMetadata && publicPreKeyBundle) {
+          this.ingestPeer(directoryMetadata, publicPreKeyBundle);
+        }
+
+        // Respond with our own key bundle and directory metadata
+        this.respondToDiscoveryRequest(senderDeviceId, handshakeId);
+        break;
+      }
+
+      case 'peer:discovery_response': {
+        const { senderDeviceId, senderUserId, targetDeviceId, directoryMetadata, publicPreKeyBundle } = event;
+
+        if (senderDeviceId === myDeviceId || senderUserId === myUserId) {
+          return;
+        }
+
+        if (targetDeviceId && targetDeviceId !== myDeviceId) {
+          return;
+        }
+
+        console.log(`[PeerDiscovery] 🤝 Discovered peer response from @${directoryMetadata?.username} (${senderDeviceId})`);
+
+        if (directoryMetadata && publicPreKeyBundle) {
+          this.ingestPeer(directoryMetadata, publicPreKeyBundle);
+        }
+        break;
+      }
+
+      case 'peer:discovery_announce': {
+        const { senderDeviceId, senderUserId, directoryMetadata, publicPreKeyBundle } = event;
+        if (senderDeviceId === myDeviceId || senderUserId === myUserId) {
+          return;
+        }
+
+        console.log(`[PeerDiscovery] ⚡ Discovered new peer announcement for @${directoryMetadata?.username}`);
+        if (directoryMetadata && publicPreKeyBundle) {
+          this.ingestPeer(directoryMetadata, publicPreKeyBundle);
+        }
+        break;
+      }
+
+      case 'peer:discovery_initial_sync': {
+        const { peers } = event;
+        if (Array.isArray(peers)) {
+          for (const item of peers) {
+            if (item.metadata && item.metadata.primaryDeviceId !== myDeviceId && item.metadata.userId !== myUserId) {
+              this.ingestPeer(item.metadata, item.preKeyBundle);
+            }
+          }
+        }
+        break;
+      }
+    }
+  }
+
+  private respondToDiscoveryRequest(targetDeviceId: string, requestHandshakeId: string) {
+    const activeCtx = this.identityManager.getActiveContext();
+    if (!activeCtx || !activeCtx.localIdentity) return;
+
+    const myDeviceId = this.identityManager.getActiveDeviceId() || `dev_${activeCtx.user.userId}`;
+    const publicPreKeyBundle = createPublicPreKeyBundle(activeCtx.localIdentity);
+
+    const directoryMetadata: PeerDiscoveryMetadata = {
+      userId: activeCtx.user.userId,
+      username: activeCtx.user.username,
+      displayName: activeCtx.user.displayName,
+      avatar: activeCtx.user.avatar,
+      role: 'Verified Peer',
+      primaryDeviceId: myDeviceId,
+      status: 'online',
+      fingerprint: activeCtx.user.identityKey.fingerprint || activeCtx.user.userId,
+      bio: `Hardware Enclave Node @${activeCtx.user.username}`,
+      isRegisteredUser: true,
+    };
+
+    const responseEvent: PeerDiscoveryHandshakeEvent = {
+      type: 'peer:discovery_response',
+      handshakeId: `resp_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
+      senderDeviceId: myDeviceId,
+      senderUserId: activeCtx.user.userId,
+      targetDeviceId,
+      directoryMetadata,
+      publicPreKeyBundle,
+      timestamp: Date.now(),
+    };
+
+    zkRelay.broadcastNetworkEvent(responseEvent);
+  }
+
+  private ingestPeer(metadata: PeerDiscoveryMetadata, bundle?: PreKeyBundle) {
+    if (!metadata || !metadata.userId) return;
+
+    // Register cryptographic PreKeyBundle in zkRelay for Double Ratchet & X3DH
+    if (bundle && bundle.deviceId) {
+      zkRelay.registerPreKeyBundle(bundle);
+    } else if (metadata.primaryDeviceId) {
+      zkRelay.registerPreKeyBundle({
+        userId: metadata.userId,
+        deviceId: metadata.primaryDeviceId,
+        identityPublicKeyHex: metadata.fingerprint || metadata.userId,
+        signedPreKeyHex: '04' + '1'.repeat(64),
+        signedPreKeySignature: '',
+      });
+    }
+
+    // Ingest into identityManager's real-time user directory
+    const isNew = this.identityManager.ingestDiscoveredUser({
+      userId: metadata.userId,
+      username: metadata.username,
+      displayName: metadata.displayName,
+      role: metadata.role || 'Verified Peer',
+      avatar: metadata.avatar || '',
+      primaryDeviceId: metadata.primaryDeviceId,
+      status: metadata.status || 'online',
+      fingerprint: metadata.fingerprint || metadata.userId,
+      bio: metadata.bio || `Peer ID: ${metadata.userId}`,
+      isRegisteredUser: true,
+    });
+
+    if (isNew) {
+      this.state.totalPeersDiscovered += 1;
+      this.state.lastDiscoveredPeerName = metadata.displayName || metadata.username;
+      this.notify();
+    }
+  }
 }
 
 const LOCAL_IDENTITY_KEY_PREFIX = 'nexus_local_id_';
@@ -52,6 +315,118 @@ class ClientIdentityManager {
   private initPromise: Promise<void> | null = null;
   private unsubscribeRelay: (() => void) | null = null;
   private unsubscribeNetwork: (() => void) | null = null;
+  private unsubscribeConnected: (() => void) | null = null;
+  private activeDirectoryPollTimer: ReturnType<typeof setInterval> | null = null;
+
+  public peerDiscovery: PeerDiscoveryService;
+
+  constructor() {
+    this.peerDiscovery = new PeerDiscoveryService(this);
+  }
+
+  public getActiveUserId(): string {
+    return this.activeUserId;
+  }
+
+  public async triggerPeerDiscovery(): Promise<void> {
+    return this.peerDiscovery.triggerHandshake(true);
+  }
+
+  public ingestDiscoveredUser(userItem: UserDirectoryItem): boolean {
+    const existingIdx = this.networkUsers.findIndex(
+      (u) => u.userId === userItem.userId || (u.primaryDeviceId && u.primaryDeviceId === userItem.primaryDeviceId)
+    );
+
+    let isNew = false;
+    if (existingIdx >= 0) {
+      this.networkUsers[existingIdx] = {
+        ...this.networkUsers[existingIdx],
+        ...userItem,
+        status: 'online',
+      };
+    } else {
+      this.networkUsers.unshift(userItem);
+      isNew = true;
+    }
+
+    this.notifyDirectoryListeners();
+    return isNew;
+  }
+
+  /**
+   * Ingests a complete ActiveDirectoryState snapshot containing peer directory items
+   * and public prekey bundles. Registers all public key bundles in zkRelay for instant
+   * X3DH initiation, enabling immediate P2P connection capability for authenticated devices.
+   */
+  public ingestActiveDirectorySnapshot(
+    peers: Array<{
+      metadata: UserDirectoryItem;
+      preKeyBundle?: PreKeyBundle;
+      deviceId: string;
+      status?: 'online' | 'idle' | 'offline';
+    }>
+  ): void {
+    if (!Array.isArray(peers) || peers.length === 0) return;
+
+    let changed = false;
+    peers.forEach((peer) => {
+      if (!peer || !peer.metadata) return;
+
+      // Skip self if matching active user & device
+      if (
+        peer.metadata.userId === this.activeUserId &&
+        peer.deviceId === this.activeDeviceId
+      ) {
+        return;
+      }
+
+      // 1. Ingest public PreKeyBundle to zkRelay
+      if (peer.preKeyBundle) {
+        zkRelay.registerPreKeyBundle(peer.preKeyBundle);
+      }
+
+      // 2. Ingest peer into local network directory
+      const isNew = this.ingestDiscoveredUser({
+        ...peer.metadata,
+        status: peer.status || 'online',
+        primaryDeviceId: peer.deviceId || peer.metadata.primaryDeviceId,
+      });
+
+      if (isNew) changed = true;
+    });
+
+    if (changed) {
+      this.notifyDirectoryListeners();
+    }
+  }
+
+  /**
+   * Automated broadcast handshake that polls the relay server for 'ActiveDirectoryState'
+   * snapshots upon successful authentication. Ensures that when a new device authenticates,
+   * it receives the public key bundles for all peers currently active on the network.
+   */
+  public async pollActiveDirectoryState(): Promise<void> {
+    try {
+      // 1. Send WebSocket broadcast poll request
+      zkRelay.broadcastNetworkEvent({
+        type: 'poll:active_directory_state',
+        requesterDeviceId: this.activeDeviceId,
+        requesterUserId: this.activeUserId,
+        timestamp: Date.now(),
+      });
+
+      // 2. Request ActiveDirectoryState snapshot over HTTP for immediate deterministic reception
+      const res = await fetch('/api/directory-state');
+      if (res.ok) {
+        const data = await res.json();
+        if (data && data.type === 'ActiveDirectoryState' && Array.isArray(data.peers)) {
+          this.ingestActiveDirectorySnapshot(data.peers);
+        }
+      }
+    } catch (err) {
+      console.warn('[ClientIdentityManager] pollActiveDirectoryState warning:', err);
+    }
+  }
 
   // Initialize or re-initialize for the authenticated account
   public async initForUser(account: {
@@ -64,7 +439,11 @@ class ClientIdentityManager {
     this.activeUserId = account.id;
     this.activeDeviceId = account.activeDeviceId || `dev_${account.id}`;
 
-    // Clean up previous subscriptions if any
+    // Clean up previous subscriptions and polling timers if any
+    if (this.activeDirectoryPollTimer) {
+      clearInterval(this.activeDirectoryPollTimer);
+      this.activeDirectoryPollTimer = null;
+    }
     if (this.unsubscribeRelay) {
       this.unsubscribeRelay();
       this.unsubscribeRelay = null;
@@ -72,6 +451,10 @@ class ClientIdentityManager {
     if (this.unsubscribeNetwork) {
       this.unsubscribeNetwork();
       this.unsubscribeNetwork = null;
+    }
+    if (this.unsubscribeConnected) {
+      this.unsubscribeConnected();
+      this.unsubscribeConnected = null;
     }
 
     // 1. Generate or load persistent cryptographic local identity
@@ -128,10 +511,20 @@ class ClientIdentityManager {
       await this.handleIncomingEnvelope(envelope);
     });
 
-    // 7. Subscribe to server broadcasts (user:registered, user:status_changed, etc.)
+    // 7. Subscribe to server broadcasts & Peer Discovery events
     this.unsubscribeNetwork = zkRelay.subscribeNetworkEvents((event) => {
-      if (event.type === 'user:registered' || event.type === 'user:profile_updated') {
+      if (
+        event.type === 'peer:discovery_request' ||
+        event.type === 'peer:discovery_response' ||
+        event.type === 'peer:discovery_announce' ||
+        event.type === 'peer:discovery_initial_sync'
+      ) {
+        this.peerDiscovery.handleDiscoveryEvent(event);
+      } else if (event.type === 'ActiveDirectoryState' && Array.isArray((event as any).peers)) {
+        this.ingestActiveDirectorySnapshot((event as any).peers);
+      } else if (event.type === 'user:registered' || event.type === 'user:profile_updated') {
         this.fetchNetworkUsers();
+        this.pollActiveDirectoryState();
       } else if (event.type === 'user:status_changed') {
         const found = this.networkUsers.find((u) => u.userId === event.userId);
         if (found) {
@@ -141,8 +534,25 @@ class ClientIdentityManager {
       }
     });
 
-    // 8. Fetch all real registered users across all devices from server
+    // 8. Automatically trigger Peer Discovery handshake when WebSocket connection establishes or reconnects
+    this.unsubscribeConnected = zkRelay.onConnected(() => {
+      this.peerDiscovery.triggerHandshake();
+      this.pollActiveDirectoryState();
+    });
+
+    // 9. Immediately trigger Peer Discovery handshake upon initial connection/load
+    this.peerDiscovery.triggerHandshake(true);
+
+    // 10. Fetch all real registered users across all devices from server
     await this.fetchNetworkUsers();
+
+    // 11. Automated broadcast handshake: poll ActiveDirectoryState snapshot for immediate P2P key exchange
+    await this.pollActiveDirectoryState();
+
+    // 12. Keep ActiveDirectoryState synchronized across network
+    this.activeDirectoryPollTimer = setInterval(() => {
+      this.pollActiveDirectoryState();
+    }, 12000);
 
     this.isInitialized = true;
   }
@@ -155,6 +565,7 @@ class ClientIdentityManager {
     this.initPromise = (async () => {
       // Fetch network users to populate contacts
       await this.fetchNetworkUsers();
+      this.peerDiscovery.triggerHandshake();
       this.isInitialized = true;
     })();
 

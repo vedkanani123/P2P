@@ -196,6 +196,8 @@ const APP_LOCK_SESSION_KEY = 'nexus_app_locked_state';
 class AuthService {
   private currentAccount: UserAccount | null = null;
   private isLocked: boolean = true;
+  private sessionVerificationRequired: boolean = false;
+  private currentDetectedTelemetry: DeviceTelemetry | null = null;
   private listeners: Array<() => void> = [];
 
   constructor() {
@@ -249,6 +251,209 @@ class AuthService {
     // If no account exists, we are not locked in PIN mode (we are in onboarding)
     if (!this.currentAccount) return false;
     return this.isLocked;
+  }
+
+  /**
+   * Ephemeral Session Verification:
+   * Returns true if device fingerprinting detected an unrecognized browser session/hardware
+   * and requires Master Password / Recovery Phrase verification before vault decryption.
+   */
+  public isSessionVerificationRequired(): boolean {
+    if (!this.currentAccount) return false;
+    return this.sessionVerificationRequired;
+  }
+
+  public getDetectedTelemetry(): DeviceTelemetry | null {
+    return this.currentDetectedTelemetry;
+  }
+
+  /**
+   * Verifies device fingerprinting (IP, OS, Browser, Screen, CPU hardware headers)
+   * during initial account load. If the fingerprint does not match locally stored
+   * account metadata, forces an ephemeral 'Session Verification' flow before allowing
+   * the user to decrypt the vault, preventing unauthorized access across browser sessions.
+   */
+  public async verifyInitialDeviceFingerprint(): Promise<boolean> {
+    if (!this.currentAccount) {
+      this.sessionVerificationRequired = false;
+      return true;
+    }
+
+    try {
+      const currentTelemetry = await collectCurrentDeviceTelemetry();
+      this.currentDetectedTelemetry = currentTelemetry;
+
+      // 1. Check if session was already verified in this tab session
+      const sessionVerifiedFp = sessionStorage.getItem('nexus_session_verified_fp');
+      if (sessionVerifiedFp === currentTelemetry.fingerprint) {
+        this.sessionVerificationRequired = false;
+        return true;
+      }
+
+      // 2. Check if the current hardware fingerprint is in the account's authorized devices list
+      const authorizedDevices = this.currentAccount.devices || [];
+      const matchingDevice = authorizedDevices.find(
+        (d) =>
+          d.fingerprint === currentTelemetry.fingerprint &&
+          d.status !== 'revoked'
+      );
+
+      if (!matchingDevice) {
+        // Fingerprint mismatch detected! Force ephemeral Session Verification
+        console.warn(
+          `[AuthService] ⚠️ Hardware fingerprint mismatch: ${currentTelemetry.fingerprint} is not among registered devices for account ${this.currentAccount.id}. Forcing Session Verification flow.`
+        );
+        this.sessionVerificationRequired = true;
+        this.isLocked = true;
+        this.notify();
+        return false;
+      }
+
+      // Recognized hardware signature: store in tab session
+      sessionStorage.setItem('nexus_session_verified_fp', currentTelemetry.fingerprint);
+      this.sessionVerificationRequired = false;
+      return true;
+    } catch (err) {
+      console.warn('[AuthService] Failed to verify initial device fingerprint:', err);
+      return true;
+    }
+  }
+
+  /**
+   * Authorizes an unrecognized hardware session using Master Password or Secret Recovery Phrase.
+   */
+  public async verifySessionWithCredentials(
+    credentialInput: string
+  ): Promise<{ success: boolean; error?: string }> {
+    if (!this.currentAccount) {
+      return { success: false, error: 'No active account found to verify.' };
+    }
+
+    const cleanInput = credentialInput.trim();
+    if (!cleanInput) {
+      return {
+        success: false,
+        error: 'Please enter your Master Account Password or 12-Word Recovery Phrase.',
+      };
+    }
+
+    // 1. Check Master Password
+    const inputHash = await hashString(cleanInput, this.currentAccount.passwordSalt);
+    let isAuthorized = inputHash === this.currentAccount.passwordHash;
+
+    // 2. Check 12-Word Secret Recovery Phrase
+    if (!isAuthorized) {
+      const normalizedStored = this.currentAccount.secretRecoveryPhrase
+        .trim()
+        .toLowerCase()
+        .replace(/\s+/g, ' ');
+      const normalizedInput = cleanInput.toLowerCase().replace(/\s+/g, ' ');
+      if (normalizedStored && normalizedStored === normalizedInput) {
+        isAuthorized = true;
+      }
+    }
+
+    if (!isAuthorized) {
+      return {
+        success: false,
+        error:
+          'Cryptographic authentication failed: Incorrect Master Password or Secret Recovery Phrase.',
+      };
+    }
+
+    // Session verified! Ingest current hardware fingerprint into authorized device list
+    const telemetry =
+      this.currentDetectedTelemetry || (await collectCurrentDeviceTelemetry());
+
+    const existingIdx = this.currentAccount.devices.findIndex(
+      (d) => d.fingerprint === telemetry.fingerprint
+    );
+
+    if (existingIdx >= 0) {
+      this.currentAccount.devices[existingIdx].lastActive = Date.now();
+      this.currentAccount.devices[existingIdx].status = 'active';
+      this.currentAccount.devices[existingIdx].ipAddress = telemetry.ipAddress;
+    } else {
+      this.currentAccount.devices.push(telemetry);
+    }
+
+    this.currentAccount.activeDeviceId = telemetry.deviceId;
+    this.saveToStorage();
+
+    sessionStorage.setItem('nexus_session_verified_fp', telemetry.fingerprint);
+    this.sessionVerificationRequired = false;
+    this.notify();
+
+    return { success: true };
+  }
+
+  /**
+   * Migration Utility: Wipes all hardcoded 'dev_' prefix data from localStorage
+   * upon the first successful registration, ensuring that subsequent production builds
+   * start from a purely blank, zero-state cryptographic registry.
+   */
+  public wipeDevPrefixDataFromLocalStorage(): { wipedKeysCount: number } {
+    let wipedKeysCount = 0;
+    try {
+      const keysToRemove: string[] = [];
+      for (let i = 0; i < localStorage.length; i++) {
+        const key = localStorage.key(i);
+        if (!key) continue;
+
+        // 1. Check if key itself starts with dev_ or contains _dev_
+        if (key.startsWith('dev_') || key.includes('_dev_')) {
+          keysToRemove.push(key);
+          continue;
+        }
+
+        // 2. Check if key is a legacy dev local identity
+        if (key.startsWith('nexus_local_id_dev_')) {
+          keysToRemove.push(key);
+          continue;
+        }
+
+        // 3. Clean out legacy pre-seeded groups containing dev_ mock records
+        if (key === 'nexus_groups_v3') {
+          try {
+            const raw = localStorage.getItem(key);
+            if (
+              raw &&
+              (raw.includes('"id":"dev_') ||
+                raw.includes('dev_elena') ||
+                raw.includes('dev_marcus') ||
+                raw.includes('dev_sarah'))
+            ) {
+              const parsed = JSON.parse(raw);
+              if (Array.isArray(parsed)) {
+                const cleaned = parsed.filter(
+                  (g: any) =>
+                    !String(g.id).startsWith('dev_') &&
+                    !String(g.id).includes('dev_') &&
+                    !String(g.createdBy).startsWith('dev_')
+                );
+                localStorage.setItem(key, JSON.stringify(cleaned));
+                wipedKeysCount++;
+              }
+            }
+          } catch {
+            // ignore
+          }
+        }
+      }
+
+      keysToRemove.forEach((k) => {
+        localStorage.removeItem(k);
+        wipedKeysCount++;
+      });
+
+      localStorage.setItem('nexus_zero_state_migrated', 'true');
+      console.log(
+        `[AuthService] Zero-state cryptographic migration: wiped ${wipedKeysCount} 'dev_' legacy items from localStorage.`
+      );
+    } catch (err) {
+      console.warn('[AuthService] wipeDevPrefixDataFromLocalStorage error:', err);
+    }
+    return { wipedKeysCount };
   }
 
   public lockApp(): void {
@@ -386,6 +591,11 @@ class AuthService {
     this.currentAccount = newAccount;
     this.isLocked = false;
     sessionStorage.setItem(APP_LOCK_SESSION_KEY, 'unlocked');
+
+    // Wipe all hardcoded 'dev_' prefix data from localStorage upon the first successful registration,
+    // ensuring that subsequent production builds start from a purely blank, zero-state cryptographic registry.
+    this.wipeDevPrefixDataFromLocalStorage();
+
     this.saveToStorage();
     return newAccount;
   }

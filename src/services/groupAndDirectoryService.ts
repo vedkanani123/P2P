@@ -28,6 +28,11 @@ class GroupAndDirectoryService {
     this.loadState();
     this.syncWithServer();
 
+    // Subscribe to real-time directory and peer discovery events
+    identityManager.subscribeDirectory(() => {
+      this.notifyListeners();
+    });
+
     // Subscribe to WebSocket network broadcasts for live updates
     zkRelay.subscribeNetworkEvents((event) => {
       if (event.type === 'group:created') {
