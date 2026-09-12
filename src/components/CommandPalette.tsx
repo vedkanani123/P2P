@@ -74,22 +74,12 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({
       },
     },
     {
-      id: 'switch_ved',
-      title: 'Switch Persona to Ved Kanani (Phone)',
-      category: 'Identity',
-      icon: Smartphone,
+      id: 'open_devices',
+      title: 'Manage Multi-Device Keys & Linked Hardware Devices',
+      category: 'Security',
+      icon: KeyRound,
       action: () => {
-        onSwitchDevice('dev_ved_phone');
-        onClose();
-      },
-    },
-    {
-      id: 'switch_elena',
-      title: 'Switch Persona to Elena Vance (Desktop)',
-      category: 'Identity',
-      icon: Laptop,
-      action: () => {
-        onSwitchDevice('dev_elena_desktop');
+        onOpenDeviceManager();
         onClose();
       },
     },
@@ -114,18 +104,8 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({
       },
     },
     {
-      id: 'open_devices',
-      title: 'Manage Multi-Device Keys & Linked Devices',
-      category: 'Security',
-      icon: KeyRound,
-      action: () => {
-        onOpenDeviceManager();
-        onClose();
-      },
-    },
-    {
       id: 'open_doc',
-      title: 'View Phase 1 Security Guarantee & Verification Document',
+      title: 'View Cryptographic Security Guarantee & Architecture Document',
       category: 'Documentation',
       icon: FileCheck,
       action: () => {

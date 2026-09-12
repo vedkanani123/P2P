@@ -113,8 +113,8 @@ export const AuthModal: React.FC<AuthModalProps> = ({
 
   if (!isOpen) return null;
 
-  // Handle Step 1: Validate details and advance to PIN setup
-  const handleProceedToPin = (e: React.FormEvent) => {
+  // Handle Step 1: Validate details and check email availability on server
+  const handleProceedToPin = async (e: React.FormEvent) => {
     e.preventDefault();
     setError(null);
 
@@ -137,6 +137,20 @@ export const AuthModal: React.FC<AuthModalProps> = ({
     if (password !== confirmPassword) {
       setError('Passwords do not match. Please verify your confirmation.');
       return;
+    }
+
+    setIsSubmitting(true);
+    try {
+      const isAvailable = await authService.checkEmailAvailability(email.trim());
+      if (!isAvailable) {
+        setError('This email address is already registered on the network. Please choose a different email or sign in.');
+        setIsSubmitting(false);
+        return;
+      }
+    } catch {
+      // offline fallback
+    } finally {
+      setIsSubmitting(false);
     }
 
     // Advance to Step 2
@@ -225,21 +239,6 @@ export const AuthModal: React.FC<AuthModalProps> = ({
       }
     } catch {
       setError('Authentication failed. Please check your credentials.');
-    } finally {
-      setIsSubmitting(false);
-    }
-  };
-
-  // Handle Quick Demo Login (Ved Kanani)
-  const handleQuickDemoLogin = async () => {
-    setIsSubmitting(true);
-    setError(null);
-    try {
-      const acc = await authService.ensureInitialAccount();
-      await authService.unlockWithPin('1234');
-      onSuccess(acc);
-    } catch {
-      setError('Demo initialization error.');
     } finally {
       setIsSubmitting(false);
     }
@@ -397,17 +396,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
                   className="w-full py-2.5 px-4 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-black font-semibold text-sm transition-all shadow-lg shadow-emerald-500/20 flex items-center justify-center gap-2"
                 >
                   <Lock className="w-4 h-4" />
-                  <span>{isSubmitting ? 'Decrypting Vault...' : 'Unlock Account'}</span>
-                </button>
-
-                <button
-                  type="button"
-                  onClick={handleQuickDemoLogin}
-                  disabled={isSubmitting}
-                  className="w-full py-2 px-3 rounded-xl bg-white/[0.04] hover:bg-white/[0.08] border border-white/[0.06] text-zinc-300 text-xs font-mono transition-colors flex items-center justify-center gap-2"
-                >
-                  <KeyRound className="w-3.5 h-3.5 text-emerald-400" />
-                  <span>1-Click Fast Login as Ved (PIN: 1234)</span>
+                  <span>{isSubmitting ? 'Verifying & Unlocking...' : 'Sign In to Account'}</span>
                 </button>
               </div>
             </form>

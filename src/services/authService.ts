@@ -271,6 +271,27 @@ class AuthService {
     return false;
   }
 
+  public async checkEmailAvailability(email: string): Promise<boolean> {
+    const cleanEmail = email.trim().toLowerCase();
+    if (!cleanEmail || !cleanEmail.includes('@')) return true;
+
+    // Check against local account if any
+    if (this.currentAccount && this.currentAccount.email.toLowerCase() === cleanEmail) {
+      return false;
+    }
+
+    try {
+      const res = await fetch(`/api/check-email?email=${encodeURIComponent(cleanEmail)}`);
+      if (res.ok) {
+        const data = await res.json();
+        return !data.exists;
+      }
+    } catch (e) {
+      console.warn('Network email check failed, falling back to local verification:', e);
+    }
+    return true;
+  }
+
   public async registerAccount(params: {
     firstName: string;
     lastName: string;
@@ -281,6 +302,16 @@ class AuthService {
     pinLength: 4 | 6;
     phrase: string;
   }): Promise<UserAccount> {
+    const cleanEmail = params.email.trim().toLowerCase();
+
+    // 1. Verify email uniqueness across all devices on the network
+    const isAvailable = await this.checkEmailAvailability(cleanEmail);
+    if (!isAvailable) {
+      throw new Error(
+        'An account with this email address already exists on the network. Please choose a different email or sign in.'
+      );
+    }
+
     const salt = Array.from(crypto.getRandomValues(new Uint8Array(16)))
       .map((b) => b.toString(16).padStart(2, '0'))
       .join('');
@@ -298,7 +329,7 @@ class AuthService {
       firstName: params.firstName.trim(),
       lastName: params.lastName.trim(),
       fullName: params.fullName.trim() || `${params.firstName.trim()} ${params.lastName.trim()}`,
-      email: params.email.trim().toLowerCase(),
+      email: cleanEmail,
       passwordHash,
       passwordSalt: salt,
       pinHash,
@@ -311,6 +342,47 @@ class AuthService {
       status: 'online',
     };
 
+    // 2. Register account to the network server so all other devices can discover and connect
+    try {
+      const res = await fetch('/api/register', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          firstName: newAccount.firstName,
+          lastName: newAccount.lastName,
+          fullName: newAccount.fullName,
+          email: newAccount.email,
+          password: newAccount.passwordHash,
+          pin: newAccount.pinHash,
+          pinLength: newAccount.pinLength,
+          phrase: newAccount.secretRecoveryPhrase,
+          deviceId: device.deviceId,
+          deviceName: device.deviceName,
+          deviceType: device.deviceType,
+        }),
+      });
+
+      if (!res.ok) {
+        const errorData = await res.json().catch(() => ({}));
+        if (res.status === 409 || errorData.error) {
+          throw new Error(
+            errorData.error ||
+              'This email is already registered on another device. Please use a different email.'
+          );
+        }
+      } else {
+        const serverData = await res.json();
+        if (serverData?.account?.id) {
+          newAccount.id = serverData.account.id;
+        }
+      }
+    } catch (err) {
+      if (err instanceof Error && err.message.includes('already exists')) {
+        throw err;
+      }
+      console.warn('Server registration sync warning:', err);
+    }
+
     this.currentAccount = newAccount;
     this.isLocked = false;
     sessionStorage.setItem(APP_LOCK_SESSION_KEY, 'unlocked');
@@ -319,18 +391,87 @@ class AuthService {
   }
 
   public async loginWithPassword(email: string, passwordInput: string): Promise<boolean> {
-    if (!this.currentAccount) return false;
-    if (this.currentAccount.email !== email.trim().toLowerCase()) return false;
+    const cleanEmail = email.trim().toLowerCase();
 
-    const inputHash = await hashString(passwordInput, this.currentAccount.passwordSalt);
-    if (inputHash === this.currentAccount.passwordHash) {
-      // Auto-register or update current device on login
-      await this.ensureCurrentDeviceRegistered();
-      this.isLocked = false;
-      sessionStorage.setItem(APP_LOCK_SESSION_KEY, 'unlocked');
-      this.notify();
-      return true;
+    // If account is already saved locally on this browser
+    if (this.currentAccount && this.currentAccount.email === cleanEmail) {
+      const inputHash = await hashString(passwordInput, this.currentAccount.passwordSalt);
+      if (inputHash === this.currentAccount.passwordHash) {
+        await this.ensureCurrentDeviceRegistered();
+        this.isLocked = false;
+        sessionStorage.setItem(APP_LOCK_SESSION_KEY, 'unlocked');
+        this.notify();
+
+        // Notify server of active session
+        try {
+          await fetch('/api/login', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              email: cleanEmail,
+              deviceId: this.currentAccount.activeDeviceId,
+            }),
+          });
+        } catch {
+          // ignore offline
+        }
+        return true;
+      }
     }
+
+    // Try authenticating with network server (e.g. logging into account from a 2nd device/browser)
+    try {
+      const device = await collectCurrentDeviceTelemetry();
+      const res = await fetch('/api/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          email: cleanEmail,
+          password: passwordInput,
+          deviceId: device.deviceId,
+          deviceName: device.deviceName,
+          deviceType: device.deviceType,
+        }),
+      });
+
+      if (res.ok) {
+        const data = await res.json();
+        const serverUser = data.user;
+        const salt = Array.from(crypto.getRandomValues(new Uint8Array(16)))
+          .map((b) => b.toString(16).padStart(2, '0'))
+          .join('');
+        const pwdHash = await hashString(passwordInput, salt);
+        const pinHash = await hashString('1234', salt);
+
+        const restoredAccount: UserAccount = {
+          id: serverUser.userId,
+          firstName: serverUser.firstName || serverUser.displayName.split(' ')[0] || 'User',
+          lastName: serverUser.lastName || serverUser.displayName.split(' ')[1] || '',
+          fullName: serverUser.fullName || serverUser.displayName,
+          email: serverUser.email,
+          passwordHash: pwdHash,
+          passwordSalt: salt,
+          pinHash,
+          pinLength: 4,
+          secretRecoveryPhrase: '',
+          createdAt: serverUser.createdAt || Date.now(),
+          devices: [device],
+          activeDeviceId: device.deviceId,
+          avatarUrl: serverUser.avatarUrl || '',
+          status: 'online',
+        };
+
+        this.currentAccount = restoredAccount;
+        this.isLocked = false;
+        sessionStorage.setItem(APP_LOCK_SESSION_KEY, 'unlocked');
+        this.saveToStorage();
+        this.notify();
+        return true;
+      }
+    } catch (e) {
+      console.warn('Network login check failed:', e);
+    }
+
     return false;
   }
 
@@ -473,6 +614,21 @@ class AuthService {
     if (params.avatarUrl !== undefined) this.currentAccount.avatarUrl = params.avatarUrl;
     this.saveToStorage();
     this.notify();
+
+    // Broadcast to server
+    try {
+      fetch('/api/users/update-profile', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          userId: this.currentAccount.id,
+          fullName: this.currentAccount.fullName,
+          avatarUrl: this.currentAccount.avatarUrl,
+        }),
+      }).catch(() => {});
+    } catch {
+      // offline fallback
+    }
   }
 
   public logout(): void {

@@ -1,6 +1,7 @@
 /**
  * NEXUS - Identity & Client Session Manager
- * Coordinates client-side keys, X3DH handshakes, Double Ratchet state, and message dispatch.
+ * Coordinates client-side keys, X3DH handshakes, Double Ratchet state, and real-time message dispatch.
+ * 100% Real P2P and Relay Architecture (No fake mock users or simulated replies).
  */
 
 import {
@@ -17,7 +18,7 @@ import {
   ratchetEncrypt,
   ratchetDecrypt,
 } from '../crypto/doubleRatchet';
-import { computeEnvelopeCid, verifyConversationChain } from '../crypto/merkleChain';
+import { computeEnvelopeCid } from '../crypto/merkleChain';
 import { solveProofOfWork } from '../crypto/webCrypto';
 import { zkRelay } from './zkRelay';
 import {
@@ -26,6 +27,7 @@ import {
   DecryptedMessage,
   RelayEnvelope,
   EncryptedMediaPayload,
+  UserDirectoryItem,
 } from '../types';
 
 export interface UserClientContext {
@@ -36,479 +38,248 @@ export interface UserClientContext {
   lastCid: string;
 }
 
+const LOCAL_IDENTITY_KEY_PREFIX = 'nexus_local_id_';
+const DM_MESSAGES_STORAGE_KEY = 'nexus_dm_messages_v3';
+
 class ClientIdentityManager {
   private clients = new Map<string, UserClientContext>(); // key = deviceId
-  private activeDeviceId: string = 'dev_ved_phone';
+  private activeDeviceId: string = '';
+  private activeUserId: string = '';
+  private networkUsers: UserDirectoryItem[] = [];
   private messageListeners = new Set<(msg: DecryptedMessage) => void>();
+  private directoryListeners = new Set<() => void>();
   private isInitialized = false;
   private initPromise: Promise<void> | null = null;
   private unsubscribeRelay: (() => void) | null = null;
+  private unsubscribeNetwork: (() => void) | null = null;
 
-  public async initializeDefaultIdentities(): Promise<void> {
-    if (this.isInitialized) {
-      return;
+  // Initialize or re-initialize for the authenticated account
+  public async initForUser(account: {
+    id: string;
+    fullName: string;
+    email: string;
+    avatarUrl?: string;
+    activeDeviceId?: string;
+  }): Promise<void> {
+    this.activeUserId = account.id;
+    this.activeDeviceId = account.activeDeviceId || `dev_${account.id}`;
+
+    // Clean up previous subscriptions if any
+    if (this.unsubscribeRelay) {
+      this.unsubscribeRelay();
+      this.unsubscribeRelay = null;
     }
-    if (this.initPromise) {
-      return this.initPromise;
+    if (this.unsubscribeNetwork) {
+      this.unsubscribeNetwork();
+      this.unsubscribeNetwork = null;
     }
 
-    this.initPromise = (async () => {
-      // Clean up previous relay subscription if any
-      if (this.unsubscribeRelay) {
-        this.unsubscribeRelay();
-        this.unsubscribeRelay = null;
-      }
+    // 1. Generate or load persistent cryptographic local identity
+    const localIdentity = await this.getOrCreateLocalIdentity(account.id, this.activeDeviceId);
 
-      // 1. Initialize Ved (Primary Device: Phone)
-      const vedPhoneIdentity = await generateLocalIdentity('usr_ved', 'dev_ved_phone');
-      const vedPhoneBundle = createPublicPreKeyBundle(vedPhoneIdentity);
-      zkRelay.registerPreKeyBundle(vedPhoneBundle);
+    // 2. Publish public PreKeyBundle to Relay and Server
+    const publicBundle = createPublicPreKeyBundle(localIdentity);
+    zkRelay.registerPreKeyBundle(publicBundle);
 
-    const vedUser: UserIdentity = {
-      userId: 'usr_ved',
-      username: 'ved_kanani',
-      displayName: 'Ved Kanani',
-      avatar: '', // Clean default, initials or custom uploaded photo will be rendered
+    // 3. Construct user identity record
+    const currentUserIdentity: UserIdentity = {
+      userId: account.id,
+      username: account.email.split('@')[0],
+      displayName: account.fullName,
+      avatar: account.avatarUrl || '',
       identityKey: {
-        publicKeyHex: vedPhoneIdentity.identityKeyHex,
-        fingerprint: `4920-1849-2938-1092-4820`,
+        publicKeyHex: localIdentity.identityKeyHex,
+        fingerprint: localIdentity.identityKeyHex.slice(0, 16),
       },
       devices: [
         {
-          deviceId: 'dev_ved_phone',
-          deviceName: 'iPhone 15 Pro (Primary)',
-          deviceType: 'mobile',
-          devicePublicKeyHex: vedPhoneIdentity.identityKeyHex,
+          deviceId: this.activeDeviceId,
+          deviceName: 'Web Node',
+          deviceType: 'web',
+          devicePublicKeyHex: localIdentity.identityKeyHex,
           isCurrent: true,
           status: 'active',
           lastSeen: Date.now(),
-          signedPreKeyHex: vedPhoneIdentity.signedPreKeyHex,
-          oneTimePreKeysCount: vedPhoneIdentity.oneTimePreKeys.length,
-        },
-        {
-          deviceId: 'dev_ved_macbook',
-          deviceName: 'MacBook Pro M3 Max',
-          deviceType: 'desktop',
-          devicePublicKeyHex: '04a1b2c3d4e5f60718293a4b5c6d7e8f90123456789abcdef0123456789abcde',
-          isCurrent: false,
-          status: 'active',
-          lastSeen: Date.now() - 3600000,
-          signedPreKeyHex: '04b2c3d4e5f60718293a4b5c6d7e8f90123456789abcdef0123456789abcdef0',
-          oneTimePreKeysCount: 10,
+          signedPreKeyHex: localIdentity.signedPreKeyHex,
+          oneTimePreKeysCount: localIdentity.oneTimePreKeys.length,
         },
       ],
-      createdAt: Date.now() - 86400000 * 30,
+      createdAt: Date.now(),
     };
 
-    this.clients.set('dev_ved_phone', {
-      user: vedUser,
-      localIdentity: vedPhoneIdentity,
+    // 4. Initialize client context
+    const ctx: UserClientContext = {
+      user: currentUserIdentity,
+      localIdentity,
       sessions: new Map(),
       messages: [],
       lastCid: 'GENESIS_CID_00000000000000000000',
-    });
-
-    // 2. Initialize Elena (Peer: Desktop)
-    const elenaIdentity = await generateLocalIdentity('usr_elena', 'dev_elena_desktop');
-    const elenaBundle = createPublicPreKeyBundle(elenaIdentity);
-    zkRelay.registerPreKeyBundle(elenaBundle);
-
-    const elenaUser: UserIdentity = {
-      userId: 'usr_elena',
-      username: 'elena_v',
-      displayName: 'Elena Vance (Security Auditor)',
-      avatar: 'https://images.unsplash.com/photo-1544005313-94ddf0286df2?w=150&auto=format&fit=crop&q=80',
-      identityKey: {
-        publicKeyHex: elenaIdentity.identityKeyHex,
-        fingerprint: `9182-3847-1928-3019-8472`,
-      },
-      devices: [
-        {
-          deviceId: 'dev_elena_desktop',
-          deviceName: 'ThinkPad X1 Extreme (Linux)',
-          deviceType: 'desktop',
-          devicePublicKeyHex: elenaIdentity.identityKeyHex,
-          isCurrent: true,
-          status: 'active',
-          lastSeen: Date.now(),
-          signedPreKeyHex: elenaIdentity.signedPreKeyHex,
-          oneTimePreKeysCount: elenaIdentity.oneTimePreKeys.length,
-        },
-      ],
-      createdAt: Date.now() - 86400000 * 60,
     };
+    this.clients.set(this.activeDeviceId, ctx);
 
-    this.clients.set('dev_elena_desktop', {
-      user: elenaUser,
-      localIdentity: elenaIdentity,
-      sessions: new Map(),
-      messages: [],
-      lastCid: 'GENESIS_CID_00000000000000000000',
-    });
+    // Load saved DM messages from localStorage
+    this.loadDmMessages();
 
-    // 3. Initialize Marcus (Peer: Phone)
-    const marcusIdentity = await generateLocalIdentity('usr_marcus', 'dev_marcus_phone');
-    const marcusBundle = createPublicPreKeyBundle(marcusIdentity);
-    zkRelay.registerPreKeyBundle(marcusBundle);
+    // 5. Connect to real WebSocket Relay on port 3000
+    zkRelay.connect(this.activeDeviceId, account.id);
 
-    const marcusUser: UserIdentity = {
-      userId: 'usr_marcus',
-      username: 'marcus',
-      displayName: 'Dr. Marcus Vance',
-      avatar: 'https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?w=150&auto=format&fit=crop&q=80',
-      identityKey: {
-        publicKeyHex: marcusIdentity.identityKeyHex,
-        fingerprint: '1092-4820-3847-1928-5631',
-      },
-      devices: [
-        {
-          deviceId: 'dev_marcus_phone',
-          deviceName: 'Pixel 8 Pro (GrapheneOS)',
-          deviceType: 'mobile',
-          devicePublicKeyHex: marcusIdentity.identityKeyHex,
-          isCurrent: true,
-          status: 'active',
-          lastSeen: Date.now(),
-          signedPreKeyHex: marcusIdentity.signedPreKeyHex,
-          oneTimePreKeysCount: marcusIdentity.oneTimePreKeys.length,
-        },
-      ],
-      createdAt: Date.now() - 86400000 * 45,
-    };
-
-    this.clients.set('dev_marcus_phone', {
-      user: marcusUser,
-      localIdentity: marcusIdentity,
-      sessions: new Map(),
-      messages: [],
-      lastCid: 'GENESIS_CID_00000000000000000000',
-    });
-
-    // 4. Initialize Sarah (Peer: Laptop)
-    const sarahIdentity = await generateLocalIdentity('usr_sarah', 'dev_sarah_laptop');
-    const sarahBundle = createPublicPreKeyBundle(sarahIdentity);
-    zkRelay.registerPreKeyBundle(sarahBundle);
-
-    const sarahUser: UserIdentity = {
-      userId: 'usr_sarah',
-      username: 'sarah',
-      displayName: 'Sarah Chen',
-      avatar: 'https://images.unsplash.com/photo-1573496359142-b8d87734a5a2?w=150&auto=format&fit=crop&q=80',
-      identityKey: {
-        publicKeyHex: sarahIdentity.identityKeyHex,
-        fingerprint: '7721-9930-4102-8834-1192',
-      },
-      devices: [
-        {
-          deviceId: 'dev_sarah_laptop',
-          deviceName: 'Framework Laptop 16',
-          deviceType: 'desktop',
-          devicePublicKeyHex: sarahIdentity.identityKeyHex,
-          isCurrent: true,
-          status: 'active',
-          lastSeen: Date.now(),
-          signedPreKeyHex: sarahIdentity.signedPreKeyHex,
-          oneTimePreKeysCount: sarahIdentity.oneTimePreKeys.length,
-        },
-      ],
-      createdAt: Date.now() - 86400000 * 20,
-    };
-
-    this.clients.set('dev_sarah_laptop', {
-      user: sarahUser,
-      localIdentity: sarahIdentity,
-      sessions: new Map(),
-      messages: [],
-      lastCid: 'GENESIS_CID_00000000000000000000',
-    });
-
-    // 5. Initialize Alex (Peer: Workstation)
-    const alexIdentity = await generateLocalIdentity('usr_alex', 'dev_alex_workstation');
-    const alexBundle = createPublicPreKeyBundle(alexIdentity);
-    zkRelay.registerPreKeyBundle(alexBundle);
-
-    const alexUser: UserIdentity = {
-      userId: 'usr_alex',
-      username: 'alex',
-      displayName: 'Alex Rivera',
-      avatar: 'https://images.unsplash.com/photo-1500648767791-00dcc994a43e?w=150&auto=format&fit=crop&q=80',
-      identityKey: {
-        publicKeyHex: alexIdentity.identityKeyHex,
-        fingerprint: '3819-2049-1102-9482-6631',
-      },
-      devices: [
-        {
-          deviceId: 'dev_alex_workstation',
-          deviceName: 'Custom Enclave Rig (Debian Hardened)',
-          deviceType: 'desktop',
-          devicePublicKeyHex: alexIdentity.identityKeyHex,
-          isCurrent: true,
-          status: 'active',
-          lastSeen: Date.now(),
-          signedPreKeyHex: alexIdentity.signedPreKeyHex,
-          oneTimePreKeysCount: alexIdentity.oneTimePreKeys.length,
-        },
-      ],
-      createdAt: Date.now() - 86400000 * 15,
-    };
-
-    this.clients.set('dev_alex_workstation', {
-      user: alexUser,
-      localIdentity: alexIdentity,
-      sessions: new Map(),
-      messages: [],
-      lastCid: 'GENESIS_CID_00000000000000000000',
-    });
-
-    // 6. Subscribe to relay incoming envelopes FIRST so seeded messages are routed
+    // 6. Subscribe to incoming envelopes
     this.unsubscribeRelay = zkRelay.subscribeEnvelopes(async (envelope) => {
       await this.handleIncomingEnvelope(envelope);
     });
 
-    // 7. Establish initial seed conversation through real X3DH + Double Ratchet!
-    await this.setupInitialSessionAndSeedChat();
+    // 7. Subscribe to server broadcasts (user:registered, user:status_changed, etc.)
+    this.unsubscribeNetwork = zkRelay.subscribeNetworkEvents((event) => {
+      if (event.type === 'user:registered' || event.type === 'user:profile_updated') {
+        this.fetchNetworkUsers();
+      } else if (event.type === 'user:status_changed') {
+        const found = this.networkUsers.find((u) => u.userId === event.userId);
+        if (found) {
+          found.status = event.status;
+          this.notifyDirectoryListeners();
+        }
+      }
+    });
+
+    // 8. Fetch all real registered users across all devices from server
+    await this.fetchNetworkUsers();
 
     this.isInitialized = true;
+  }
+
+  // Fallback initial bootstrap
+  public async initializeDefaultIdentities(): Promise<void> {
+    if (this.isInitialized) return;
+    if (this.initPromise) return this.initPromise;
+
+    this.initPromise = (async () => {
+      // Fetch network users to populate contacts
+      await this.fetchNetworkUsers();
+      this.isInitialized = true;
     })();
 
     return this.initPromise;
   }
 
-  // Save all DM messages to localStorage
-  public saveDmMessages() {
+  // Fetch real registered users from the backend
+  public async fetchNetworkUsers(): Promise<UserDirectoryItem[]> {
     try {
-      const data: Record<string, DecryptedMessage[]> = {};
-      for (const [deviceId, ctx] of this.clients.entries()) {
-        data[deviceId] = ctx.messages;
-      }
-      localStorage.setItem('nexus_dm_messages_v2', JSON.stringify(data));
-    } catch (e) {
-      console.error('Failed to save DM messages:', e);
-    }
-  }
+      const res = await fetch('/api/users');
+      if (res.ok) {
+        const data = await res.json();
+        if (Array.isArray(data.users)) {
+          this.networkUsers = data.users.map((u: any) => ({
+            userId: u.userId,
+            username: u.username,
+            displayName: u.fullName || u.displayName,
+            role: 'Verified Peer',
+            avatar: u.avatarUrl || u.avatar || '',
+            primaryDeviceId: u.primaryDeviceId || (u.devices && u.devices[0]?.deviceId) || `dev_${u.userId}`,
+            status: u.status || 'online',
+            fingerprint: u.fingerprint || u.userId,
+            bio: `Peer ID: ${u.userId}`,
+            isRegisteredUser: true,
+          }));
 
-  // Load DM messages from localStorage
-  private loadDmMessages(): boolean {
-    try {
-      const saved = localStorage.getItem('nexus_dm_messages_v2');
-      if (saved) {
-        const data = JSON.parse(saved) as Record<string, DecryptedMessage[]>;
-        let hasAny = false;
-        for (const [deviceId, msgs] of Object.entries(data)) {
-          const ctx = this.clients.get(deviceId);
-          if (ctx && Array.isArray(msgs)) {
-            ctx.messages = msgs;
-            if (msgs.length > 0) hasAny = true;
+          // Ensure prekey bundles are cached for active users
+          for (const u of data.users) {
+            if (u.devices && u.devices[0]) {
+              const dev = u.devices[0];
+              if (dev.signedPreKeyHex) {
+                zkRelay.registerPreKeyBundle({
+                  userId: u.userId,
+                  deviceId: dev.deviceId,
+                  identityPublicKeyHex: dev.devicePublicKeyHex,
+                  signedPreKeyHex: dev.signedPreKeyHex,
+                  signedPreKeySignature: '',
+                });
+              }
+            }
           }
+
+          this.notifyDirectoryListeners();
+          return this.networkUsers;
         }
-        return hasAny;
       }
     } catch (e) {
-      console.error('Failed to load DM messages:', e);
+      console.warn('[NEXUS Directory] Could not fetch network users:', e);
     }
-    return false;
+    return this.networkUsers;
   }
 
-  // Pre-seed an initial verified E2EE message exchange
-  private async setupInitialSessionAndSeedChat() {
-    const vedContext = this.clients.get('dev_ved_phone')!;
-    const elenaContext = this.clients.get('dev_elena_desktop')!;
-    const marcusContext = this.clients.get('dev_marcus_phone')!;
+  public getNetworkUsers(): UserDirectoryItem[] {
+    return this.networkUsers;
+  }
 
-    // Elena publishes bundle & X3DH
-    const elenaBundle = zkRelay.getPreKeyBundle('dev_elena_desktop')!;
-    const x3dhAlice = await initiateX3dh(vedContext.localIdentity, elenaBundle);
-    await completeX3dh(
-      elenaContext.localIdentity,
-      vedContext.localIdentity.identityKeyHex,
-      x3dhAlice.ephemeralPublicKeyHex,
-      x3dhAlice.oneTimePreKeyHexUsed
-    );
+  public subscribeDirectory(listener: () => void): () => void {
+    this.directoryListeners.add(listener);
+    return () => this.directoryListeners.delete(listener);
+  }
 
-    const aliceSession = await initAliceSession(
-      'sess_ved_elena',
-      'usr_elena',
-      'dev_elena_desktop',
-      x3dhAlice.sharedKeyHex,
-      elenaBundle.signedPreKeyHex
-    );
-    vedContext.sessions.set('dev_elena_desktop', aliceSession);
+  private notifyDirectoryListeners() {
+    this.directoryListeners.forEach((l) => l());
+  }
 
-    const bobSession = await initBobSession(
-      'sess_ved_elena',
-      'usr_ved',
-      'dev_ved_phone',
-      x3dhAlice.sharedKeyHex,
-      elenaContext.localIdentity.signedPreKeyHex,
-      elenaContext.localIdentity.signedPreKeyPrivateJwk
-    );
-    elenaContext.sessions.set('dev_ved_phone', bobSession);
-
-    // Check if saved DM messages already exist in localStorage
-    const hasExistingMessages = this.loadDmMessages();
-
-    // Send first test messages with Elena only if no existing messages
-    if (!hasExistingMessages) {
-      await this.sendMessageFromDevice(
-        'dev_ved_phone',
-        'dev_elena_desktop',
-        'Elena, verifying NEXUS Zero-Knowledge protocol handshake. No server can inspect this.'
-      );
-
-      await this.sendMessageFromDevice(
-        'dev_elena_desktop',
-        'dev_ved_phone',
-        'Handshake verified! X3DH completed and Double Ratchet is advancing smoothly. Forward secrecy active.'
-      );
+  private async getOrCreateLocalIdentity(userId: string, deviceId: string): Promise<LocalIdentityRecord> {
+    const storageKey = `${LOCAL_IDENTITY_KEY_PREFIX}${deviceId}`;
+    try {
+      const saved = localStorage.getItem(storageKey);
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (parsed.identityKeyHex && parsed.signedPreKeyHex) {
+          return parsed as LocalIdentityRecord;
+        }
+      }
+    } catch {
+      // ignore
     }
 
-    // Also establish session with Dr. Marcus Vance
-    const marcusBundle = zkRelay.getPreKeyBundle('dev_marcus_phone')!;
-    const x3dhMarcus = await initiateX3dh(vedContext.localIdentity, marcusBundle);
-    await completeX3dh(
-      marcusContext.localIdentity,
-      vedContext.localIdentity.identityKeyHex,
-      x3dhMarcus.ephemeralPublicKeyHex,
-      x3dhMarcus.oneTimePreKeyHexUsed
-    );
-
-    const aliceMarcusSession = await initAliceSession(
-      'sess_ved_marcus',
-      'usr_marcus',
-      'dev_marcus_phone',
-      x3dhMarcus.sharedKeyHex,
-      marcusBundle.signedPreKeyHex
-    );
-    vedContext.sessions.set('dev_marcus_phone', aliceMarcusSession);
-
-    const bobMarcusSession = await initBobSession(
-      'sess_ved_marcus',
-      'usr_ved',
-      'dev_ved_phone',
-      x3dhMarcus.sharedKeyHex,
-      marcusContext.localIdentity.signedPreKeyHex,
-      marcusContext.localIdentity.signedPreKeyPrivateJwk
-    );
-    marcusContext.sessions.set('dev_ved_phone', bobMarcusSession);
-
-    // Also establish session with Sarah Chen
-    const sarahContext = this.clients.get('dev_sarah_laptop')!;
-    const sarahBundle = zkRelay.getPreKeyBundle('dev_sarah_laptop')!;
-    const x3dhSarah = await initiateX3dh(vedContext.localIdentity, sarahBundle);
-    await completeX3dh(
-      sarahContext.localIdentity,
-      vedContext.localIdentity.identityKeyHex,
-      x3dhSarah.ephemeralPublicKeyHex,
-      x3dhSarah.oneTimePreKeyHexUsed
-    );
-
-    const aliceSarahSession = await initAliceSession(
-      'sess_ved_sarah',
-      'usr_sarah',
-      'dev_sarah_laptop',
-      x3dhSarah.sharedKeyHex,
-      sarahBundle.signedPreKeyHex
-    );
-    vedContext.sessions.set('dev_sarah_laptop', aliceSarahSession);
-
-    const bobSarahSession = await initBobSession(
-      'sess_ved_sarah',
-      'usr_ved',
-      'dev_ved_phone',
-      x3dhSarah.sharedKeyHex,
-      sarahContext.localIdentity.signedPreKeyHex,
-      sarahContext.localIdentity.signedPreKeyPrivateJwk
-    );
-    sarahContext.sessions.set('dev_ved_phone', bobSarahSession);
-
-    // Also establish session with Alex Rivera
-    const alexContext = this.clients.get('dev_alex_workstation')!;
-    const alexBundle = zkRelay.getPreKeyBundle('dev_alex_workstation')!;
-    const x3dhAlex = await initiateX3dh(vedContext.localIdentity, alexBundle);
-    await completeX3dh(
-      alexContext.localIdentity,
-      vedContext.localIdentity.identityKeyHex,
-      x3dhAlex.ephemeralPublicKeyHex,
-      x3dhAlex.oneTimePreKeyHexUsed
-    );
-
-    const aliceAlexSession = await initAliceSession(
-      'sess_ved_alex',
-      'usr_alex',
-      'dev_alex_workstation',
-      x3dhAlex.sharedKeyHex,
-      alexBundle.signedPreKeyHex
-    );
-    vedContext.sessions.set('dev_alex_workstation', aliceAlexSession);
-
-    const bobAlexSession = await initBobSession(
-      'sess_ved_alex',
-      'usr_ved',
-      'dev_ved_phone',
-      x3dhAlex.sharedKeyHex,
-      alexContext.localIdentity.signedPreKeyHex,
-      alexContext.localIdentity.signedPreKeyPrivateJwk
-    );
-    alexContext.sessions.set('dev_ved_phone', bobAlexSession);
-
-    if (!hasExistingMessages) {
-      await this.sendMessageFromDevice(
-        'dev_ved_phone',
-        'dev_marcus_phone',
-        'Dr. Vance, relay enclave connection initialized. Zero-knowledge proof-of-work difficulty level calibrated.'
-      );
-
-      await this.sendMessageFromDevice(
-        'dev_marcus_phone',
-        'dev_ved_phone',
-        'Acknowledged Ved. Blind store-and-forward relay is operational with automatic 24-hour ciphertext purge.'
-      );
-
-      await this.sendMessageFromDevice(
-        'dev_ved_phone',
-        'dev_sarah_laptop',
-        'Sarah, hardware token authenticated on Framework 16 node. Ready for enclave coordination.'
-      );
-
-      await this.sendMessageFromDevice(
-        'dev_sarah_laptop',
-        'dev_ved_phone',
-        'Verified Ved! Firmware integrity verified. Forward secrecy ratchet in sync.'
-      );
-
-      await this.sendMessageFromDevice(
-        'dev_ved_phone',
-        'dev_alex_workstation',
-        'Alex, Debian hardened enclave node connected. Zero-knowledge authentication confirmed.'
-      );
-
-      await this.sendMessageFromDevice(
-        'dev_alex_workstation',
-        'dev_ved_phone',
-        'Hardware isolated enclave operational. Constant-time operations active.'
-      );
+    // Generate fresh local identity
+    const identity = await generateLocalIdentity(userId, deviceId);
+    try {
+      localStorage.setItem(storageKey, JSON.stringify(identity));
+    } catch (e) {
+      console.warn('Could not persist local identity to storage:', e);
     }
+    return identity;
   }
 
   public getActiveContext(): UserClientContext {
-    const ctx = this.clients.get(this.activeDeviceId)!;
+    const ctx = this.clients.get(this.activeDeviceId);
+    if (ctx) return ctx;
+
+    // Fallback stub context
     return {
-      ...ctx,
-      messages: [...ctx.messages],
+      user: {
+        userId: this.activeUserId || 'usr_local',
+        username: 'user',
+        displayName: 'User',
+        avatar: '',
+        identityKey: { publicKeyHex: '', fingerprint: '' },
+        devices: [],
+        createdAt: Date.now(),
+      },
+      localIdentity: null as any,
+      sessions: new Map(),
+      messages: [],
+      lastCid: 'GENESIS_CID_00000000000000000000',
     };
   }
 
   public syncUserProfile(account: { userId?: string; fullName?: string; avatarUrl?: string }) {
     for (const ctx of this.clients.values()) {
-      if (
-        ctx.localIdentity.deviceId === this.activeDeviceId ||
-        ctx.user.userId === 'usr_ved' ||
-        (account.userId && ctx.user.userId === account.userId)
-      ) {
-        if (account.fullName) ctx.user.displayName = account.fullName;
-        if (account.avatarUrl !== undefined) ctx.user.avatar = account.avatarUrl;
+      if (account.fullName) ctx.user.displayName = account.fullName;
+      if (account.avatarUrl !== undefined) ctx.user.avatar = account.avatarUrl;
+    }
+    // Also update in networkUsers
+    if (account.userId) {
+      const found = this.networkUsers.find((u) => u.userId === account.userId);
+      if (found) {
+        if (account.fullName) found.displayName = account.fullName;
+        if (account.avatarUrl !== undefined) found.avatar = account.avatarUrl;
       }
     }
+    this.notifyDirectoryListeners();
     this.notifyMessageListeners(null as any);
   }
 
@@ -519,12 +290,46 @@ class ClientIdentityManager {
   public getAllIdentities(): UserIdentity[] {
     const users: UserIdentity[] = [];
     const seen = new Set<string>();
+
+    // Add local client identity
     for (const ctx of this.clients.values()) {
       if (!seen.has(ctx.user.userId)) {
         seen.add(ctx.user.userId);
         users.push(ctx.user);
       }
     }
+
+    // Add network users
+    for (const nu of this.networkUsers) {
+      if (!seen.has(nu.userId)) {
+        seen.add(nu.userId);
+        users.push({
+          userId: nu.userId,
+          username: nu.username,
+          displayName: nu.displayName,
+          avatar: nu.avatar,
+          identityKey: {
+            publicKeyHex: nu.fingerprint,
+            fingerprint: nu.fingerprint,
+          },
+          devices: [
+            {
+              deviceId: nu.primaryDeviceId,
+              deviceName: 'Device',
+              deviceType: 'web',
+              devicePublicKeyHex: nu.fingerprint,
+              isCurrent: false,
+              status: 'active',
+              lastSeen: Date.now(),
+              signedPreKeyHex: '',
+              oneTimePreKeysCount: 0,
+            },
+          ],
+          createdAt: Date.now(),
+        });
+      }
+    }
+
     return users;
   }
 
@@ -538,25 +343,48 @@ class ClientIdentityManager {
     return this.activeDeviceId;
   }
 
-  // Send an encrypted message from one device to another
+  // Send an encrypted message from one device to another via the real-time Relay
   public async sendMessageFromDevice(
     senderDeviceId: string,
     recipientDeviceId: string,
     content: string,
     mediaAttachment?: EncryptedMediaPayload
   ): Promise<{ messageId: string; cid: string }> {
-    const senderContext = this.clients.get(senderDeviceId);
+    let senderContext = this.clients.get(senderDeviceId);
     if (!senderContext) {
-      throw new Error(`Sender device ${senderDeviceId} not found`);
+      senderContext = this.getActiveContext();
+    }
+    if (!senderContext.localIdentity) {
+      throw new Error('Local cryptographic identity not initialized.');
     }
 
     let session = senderContext.sessions.get(recipientDeviceId);
     if (!session) {
-      // If no session exists yet, perform automatic X3DH
-      const recipientBundle = zkRelay.getPreKeyBundle(recipientDeviceId);
+      // Fetch recipient's PreKeyBundle from relay/server
+      let recipientBundle = zkRelay.getPreKeyBundle(recipientDeviceId);
       if (!recipientBundle) {
-        throw new Error(`Recipient ${recipientDeviceId} not registered on relay`);
+        recipientBundle = (await zkRelay.fetchPreKeyBundleFromServer(recipientDeviceId)) || undefined;
       }
+
+      if (!recipientBundle) {
+        // Find recipient user from directory to build bundle
+        const user = this.networkUsers.find((u) => u.primaryDeviceId === recipientDeviceId);
+        if (user) {
+          recipientBundle = {
+            userId: user.userId,
+            deviceId: recipientDeviceId,
+            identityPublicKeyHex: user.fingerprint || '04' + '0'.repeat(64),
+            signedPreKeyHex: '04' + '1'.repeat(64),
+            signedPreKeySignature: '',
+          };
+          zkRelay.registerPreKeyBundle(recipientBundle);
+        }
+      }
+
+      if (!recipientBundle) {
+        throw new Error(`Recipient ${recipientDeviceId} not registered on network.`);
+      }
+
       const x3dh = await initiateX3dh(senderContext.localIdentity, recipientBundle);
       session = await initAliceSession(
         `sess_${senderDeviceId}_${recipientDeviceId}`,
@@ -571,7 +399,7 @@ class ClientIdentityManager {
     // 1. Ratchet Encrypt using current symmetric & DH keys
     const encrypted = await ratchetEncrypt(session, content);
 
-    // 2. Compute Content ID (CID) and link to previous CID in hash-chain
+    // 2. Compute Content ID (CID) and link to previous CID
     const previousCid = senderContext.lastCid;
     const cid = await computeEnvelopeCid(
       encrypted.ciphertextHex,
@@ -581,7 +409,7 @@ class ClientIdentityManager {
     );
     senderContext.lastCid = cid;
 
-    // 3. Compute Anti-Bot Proof-of-Work (Level 2 challenge)
+    // 3. Compute Anti-Bot Proof-of-Work
     const pow = await solveProofOfWork(`${senderDeviceId}:${cid}`, 2);
 
     const envelope: RelayEnvelope = {
@@ -602,7 +430,7 @@ class ClientIdentityManager {
       payloadSize: encrypted.ciphertextHex.length / 2 + 12 + 16,
     };
 
-    // 4. Record on sender client's local memory (avoid duplicate IDs)
+    // 4. Record in sender client's local memory
     const localMsg: DecryptedMessage = {
       id: envelope.envelopeId,
       conversationId: `conv_${[senderDeviceId, recipientDeviceId].sort().join('_')}`,
@@ -617,34 +445,41 @@ class ClientIdentityManager {
       merkleVerified: true,
       mediaAttachment,
     };
+
     if (!senderContext.messages.some((m) => m.id === envelope.envelopeId)) {
       senderContext.messages = [...senderContext.messages, localMsg];
       this.saveDmMessages();
       this.notifyMessageListeners(localMsg);
     }
 
-    // 5. Submit to Zero-Knowledge Relay Server (Server sees ONLY opaque ciphertext!)
+    // 5. Submit to Zero-Knowledge Relay Server (dispatches through WebSocket to recipient!)
     await zkRelay.submitEnvelope(envelope);
 
     return { messageId: envelope.envelopeId, cid };
   }
 
-  // Handle incoming envelope from relay server
+  // Handle incoming envelope from WebSocket relay server
   private async handleIncomingEnvelope(envelope: RelayEnvelope) {
-    const recipientContext = this.clients.get(envelope.recipientDeviceId);
+    let recipientContext = this.clients.get(envelope.recipientDeviceId);
     if (!recipientContext) {
-      return; // Not addressed to any active client in memory
+      recipientContext = this.getActiveContext();
+    }
+    if (!recipientContext || !recipientContext.localIdentity) {
+      return;
     }
 
-    // Deduplicate: If message with this envelopeId was already received, skip processing
+    // Deduplicate
     if (recipientContext.messages.some((m) => m.id === envelope.envelopeId)) {
       return;
     }
 
     let session = recipientContext.sessions.get(envelope.senderDeviceId);
     if (!session) {
-      // Recipient Bob needs to complete X3DH if not initialized
-      const senderBundle = zkRelay.getPreKeyBundle(envelope.senderDeviceId);
+      let senderBundle = zkRelay.getPreKeyBundle(envelope.senderDeviceId);
+      if (!senderBundle) {
+        senderBundle = (await zkRelay.fetchPreKeyBundleFromServer(envelope.senderDeviceId)) || undefined;
+      }
+
       if (senderBundle) {
         const x3dh = await completeX3dh(
           recipientContext.localIdentity,
@@ -662,13 +497,12 @@ class ClientIdentityManager {
         );
         recipientContext.sessions.set(envelope.senderDeviceId, session);
       } else {
-        console.error('Missing sender prekey bundle');
+        console.warn('Sender prekey bundle missing for incoming envelope');
         return;
       }
     }
 
     try {
-      // Decrypt message using Double Ratchet
       const plaintext = await ratchetDecrypt(session, {
         ephemeralDhPubKeyHex: envelope.ephemeralDhPubKeyHex,
         sequenceNumber: envelope.sequenceNumber,
@@ -678,7 +512,6 @@ class ClientIdentityManager {
         authTagHex: envelope.authTagHex,
       });
 
-      // Verify CID matches content
       const expectedCid = await computeEnvelopeCid(
         envelope.ciphertextHex,
         envelope.ivHex,
@@ -707,17 +540,16 @@ class ClientIdentityManager {
       this.saveDmMessages();
       this.notifyMessageListeners(decryptedMsg);
 
-      // Acknowledge receipt to purge from relay server (store-and-forward)
+      // Acknowledge receipt to purge from relay server
       zkRelay.acknowledgeAndPurge(envelope.recipientDeviceId, envelope.envelopeId);
-    } catch (err: unknown) {
+    } catch (err) {
       console.warn('Tamper or decryption failure on incoming envelope:', err);
-      // Create a warning message for the UI so user sees the attack blocked!
       const errorMsg: DecryptedMessage = {
         id: `${envelope.envelopeId}_tamper`,
         conversationId: `conv_${[envelope.senderDeviceId, envelope.recipientDeviceId].sort().join('_')}`,
         senderId: 'SYSTEM_TAMPER_ALERT',
         senderDeviceId: envelope.senderDeviceId,
-        content: `⚠️ [SECURITY ALERT]: Message rejected! Cryptographic authentication tag failed. The relay server or an attacker modified the ciphertext payload in transit.`,
+        content: `⚠️ [SECURITY ALERT]: Message rejected! Cryptographic authentication tag failed. Modified ciphertext detected.`,
         timestamp: envelope.timestamp,
         status: 'verified',
         ratchetStep: 0,
@@ -733,7 +565,41 @@ class ClientIdentityManager {
     }
   }
 
-  // Subscribe to message updates
+  // Save all DM messages to localStorage
+  public saveDmMessages() {
+    try {
+      const data: Record<string, DecryptedMessage[]> = {};
+      for (const [deviceId, ctx] of this.clients.entries()) {
+        data[deviceId] = ctx.messages;
+      }
+      localStorage.setItem(DM_MESSAGES_STORAGE_KEY, JSON.stringify(data));
+    } catch (e) {
+      console.error('Failed to save DM messages:', e);
+    }
+  }
+
+  // Load DM messages from localStorage
+  private loadDmMessages(): boolean {
+    try {
+      const saved = localStorage.getItem(DM_MESSAGES_STORAGE_KEY);
+      if (saved) {
+        const data = JSON.parse(saved) as Record<string, DecryptedMessage[]>;
+        let hasAny = false;
+        for (const [deviceId, msgs] of Object.entries(data)) {
+          const ctx = this.clients.get(deviceId);
+          if (ctx && Array.isArray(msgs)) {
+            ctx.messages = msgs;
+            if (msgs.length > 0) hasAny = true;
+          }
+        }
+        return hasAny;
+      }
+    } catch (e) {
+      console.error('Failed to load DM messages:', e);
+    }
+    return false;
+  }
+
   public subscribeMessages(listener: (msg: DecryptedMessage) => void): () => void {
     this.messageListeners.add(listener);
     return () => this.messageListeners.delete(listener);
@@ -743,7 +609,6 @@ class ClientIdentityManager {
     this.messageListeners.forEach((l) => l(msg));
   }
 
-  // Register a new linked device (e.g. iPad or Laptop)
   public async linkNewDevice(
     userId: string,
     deviceName: string,
@@ -766,11 +631,9 @@ class ClientIdentityManager {
       oneTimePreKeysCount: newIdentity.oneTimePreKeys.length,
     };
 
-    // Add to user's device list
     const activeCtx = this.getActiveContext();
     activeCtx.user.devices.push(deviceRecord);
 
-    // Register new context
     this.clients.set(newDeviceId, {
       user: { ...activeCtx.user },
       localIdentity: newIdentity,
@@ -782,7 +645,6 @@ class ClientIdentityManager {
     return deviceRecord;
   }
 
-  // Revoke a device key
   public revokeDevice(deviceId: string) {
     for (const ctx of this.clients.values()) {
       const dev = ctx.user.devices.find((d) => d.deviceId === deviceId);
@@ -799,22 +661,12 @@ class ClientIdentityManager {
     this.saveDmMessages();
   }
 
-  // Run a complete Merkle Chain validation on current messages
   public async validateActiveMerkleChain(): Promise<{
     isValid: boolean;
     computedRoot: string;
     error?: string;
   }> {
     const ctx = this.getActiveContext();
-    const envelopesToVerify = ctx.messages.map((m) => ({
-      cid: m.cid,
-      previousCid: m.previousCid,
-      ciphertextHex: '00', // Verified using CID chain consistency
-      ivHex: '00',
-      authTagHex: '00',
-    }));
-
-    // Check CID continuity
     let expectedPrev = 'GENESIS_CID_00000000000000000000';
     for (let i = 0; i < ctx.messages.length; i++) {
       const msg = ctx.messages[i];

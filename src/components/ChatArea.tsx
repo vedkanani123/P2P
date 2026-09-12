@@ -46,7 +46,6 @@ interface ChatAreaProps {
   onOpenGroupInfo?: (groupId: string) => void;
   onBackToSidebar?: () => void;
   onClearTamperAlerts?: () => void;
-  onTriggerSimulatePeer?: (peerDeviceId: string) => void;
 }
 
 export const ChatArea: React.FC<ChatAreaProps> = ({
@@ -60,7 +59,6 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
   onOpenGroupInfo,
   onBackToSidebar,
   onClearTamperAlerts,
-  onTriggerSimulatePeer,
 }) => {
   const [inputText, setInputText] = useState('');
   const [isSending, setIsSending] = useState(false);
@@ -117,6 +115,17 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
 
   // Direct peer lookup when in DM mode
   const peerInfo = useMemo(() => {
+    if (!peerDeviceId) {
+      return {
+        name: 'No Peer Selected',
+        username: 'select_peer',
+        role: 'Select a peer from the directory to start messaging',
+        avatar: 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=150&auto=format&fit=crop&q=80',
+        status: 'offline' as const,
+        fingerprint: '0000-0000-0000-0000',
+      };
+    }
+
     const networkUser = groupAndDirectoryService.getUserByDeviceId(peerDeviceId);
     if (networkUser) {
       return {
@@ -137,21 +146,19 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
         username: ctx.user.username,
         role: 'Authenticated Enclave Peer',
         avatar: ctx.user.avatar,
-        status: 'online',
+        status: 'online' as const,
         fingerprint: ctx.user.identityKey.fingerprint,
       };
     }
 
-    // Default fallback
+    // Default fallback for any peer
     return {
-      name: peerDeviceId === 'dev_elena_desktop' ? 'Elena Vance' : 'Dr. Marcus Vance',
-      username: peerDeviceId === 'dev_elena_desktop' ? 'elena' : 'marcus',
-      role: peerDeviceId === 'dev_elena_desktop' ? 'Security Auditor & Cryptographer' : 'Zero-Knowledge Relay Enclave',
-      avatar: peerDeviceId === 'dev_elena_desktop'
-        ? 'https://images.unsplash.com/photo-1544005313-94ddf0286df2?w=150&auto=format&fit=crop&q=80'
-        : 'https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?w=150&auto=format&fit=crop&q=80',
-      status: 'online',
-      fingerprint: '9182-3847-1928-3019-8472',
+      name: 'Connected Peer',
+      username: 'peer',
+      role: 'Hardware Enclave Node',
+      avatar: 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=150&auto=format&fit=crop&q=80',
+      status: 'online' as const,
+      fingerprint: peerDeviceId,
     };
   }, [peerDeviceId]);
 
@@ -360,18 +367,6 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                   {activeGroup.pendingRequests.filter((r) => r.status === 'pending').length}
                 </span>
               )}
-            </button>
-          )}
-
-          {/* DM Peer Simulation Button */}
-          {!isGroupMode && onTriggerSimulatePeer && (
-            <button
-              onClick={() => onTriggerSimulatePeer(peerDeviceId)}
-              className="flex items-center gap-1.5 px-2 sm:px-2.5 py-1.5 rounded-lg bg-white/[0.04] hover:bg-white/[0.08] border border-white/[0.06] text-xs font-mono text-zinc-300 transition-colors"
-              title={`Simulate response from ${peerInfo.name}`}
-            >
-              <Sparkles className="w-3.5 h-3.5 text-emerald-400" />
-              <span className="hidden sm:inline">Reply as {peerInfo.username}</span>
             </button>
           )}
 

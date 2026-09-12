@@ -72,21 +72,26 @@ export default function App() {
       if (currentAcc) {
         setAccount(currentAcc);
         setIsLocked(authService.isAppLocked());
+        setActiveDeviceId(currentAcc.activeDeviceId);
+
         // Auto-register current device hardware & IP
         await authService.ensureCurrentDeviceRegistered();
-        identityManager.syncUserProfile({
-          userId: currentAcc.id,
-          fullName: currentAcc.fullName,
-          avatarUrl: currentAcc.avatarUrl,
-        });
+
+        // Initialize user's real cryptographic keys and WebSocket relay
+        await identityManager.initForUser(currentAcc);
+
+        const peers = identityManager.getNetworkUsers().filter((u) => u.userId !== currentAcc.id);
+        if (peers.length > 0) {
+          setPeerDeviceId(peers[0].primaryDeviceId);
+        } else {
+          setPeerDeviceId('');
+        }
       } else {
         setAccount(null);
         setIsLocked(false);
         setAuthModalInitialMode('login');
       }
 
-      // Initialize cryptographic keys and Double Ratchet channels
-      await identityManager.initializeDefaultIdentities();
       setIsReady(true);
     }
     init();
@@ -104,6 +109,11 @@ export default function App() {
       setForceUpdate((prev) => prev + 1);
     });
 
+    // Subscribe to directory changes (when other devices/users register)
+    const unsubDir = identityManager.subscribeDirectory(() => {
+      setForceUpdate((prev) => prev + 1);
+    });
+
     // Subscribe to group state updates
     const unsubGroups = groupAndDirectoryService.subscribe(() => {
       setForceUpdate((prev) => prev + 1);
@@ -116,6 +126,7 @@ export default function App() {
     return () => {
       unsubAuth();
       unsubMsg();
+      unsubDir();
       unsubGroups();
       unsubWiretap();
     };
@@ -145,11 +156,6 @@ export default function App() {
   const handleSwitchDevice = useCallback((deviceId: string) => {
     identityManager.switchActiveDevice(deviceId);
     setActiveDeviceId(deviceId);
-    if (deviceId === 'dev_ved_phone') {
-      setPeerDeviceId('dev_elena_desktop');
-    } else {
-      setPeerDeviceId('dev_ved_phone');
-    }
     setForceUpdate((prev) => prev + 1);
   }, []);
 
@@ -168,58 +174,10 @@ export default function App() {
     setForceUpdate((prev) => prev + 1);
   }, []);
 
-  // Peer Simulation: lets Elena, Marcus, Sarah, or Alex advance Double Ratchet and reply
-  const handleTriggerSimulatePeer = useCallback(
-    async (targetPeerDeviceId: string) => {
-      const peerReplies: Record<string, string[]> = {
-        dev_elena_desktop: [
-          'X3DH session active. Double Ratchet advanced with fresh ephemeral entropy.',
-          'Auditing Merkle hash-chain... Zero-knowledge state consistency confirmed.',
-          'Payload decrypted client-side. No intermediate relay logs found.',
-          'Forward secrecy verified. Next message uses a fresh DH ratchet pair.',
-        ],
-        dev_marcus_phone: [
-          'Acknowledged. Blind store-and-forward relay is operational with automatic 24-hour ciphertext purge.',
-          'GrapheneOS hardware keystore verified. Zero-knowledge proof-of-work accepted.',
-          'Double Ratchet forward secrecy is advancing smoothly.',
-          'Zero-knowledge proof-of-work calibrated to difficulty 2.',
-        ],
-        dev_sarah_laptop: [
-          'Hardware security token verified on Framework 16 node. Handshake confirmed.',
-          'Ratchet step verified. Client-side end-to-end encryption intact.',
-          'Ephemeral session state matches local Merkle root hash.',
-          'Key rotation scheduled for next epoch.',
-        ],
-        dev_alex_workstation: [
-          'Debian hardened enclave rig operational. Relay ciphertext envelope authenticated.',
-          'AES-256-GCM authentication tag verified. No bit-flip tampering detected.',
-          'Zero-knowledge protocol handshake complete.',
-          'Constant-time cryptography execution verified without timing leaks.',
-        ],
-      };
-
-      const pool = peerReplies[targetPeerDeviceId] || [
-        'Message received and verified through zero-knowledge Double Ratchet.',
-      ];
-      const reply = pool[Math.floor(Math.random() * pool.length)];
-
-      try {
-        await identityManager.sendMessageFromDevice(
-          targetPeerDeviceId,
-          activeDeviceId,
-          reply
-        );
-        setForceUpdate((prev) => prev + 1);
-      } catch (err) {
-        console.error('Peer reply error:', err);
-      }
-    },
-    [activeDeviceId]
-  );
-
-  // Sending messages for direct peer chat
+  // Sending messages for direct peer chat (relayed in real-time over WebSocket to recipient device)
   const handleSendMessage = useCallback(
     async (content: string, media?: EncryptedMediaPayload) => {
+      if (!peerDeviceId) return;
       await identityManager.sendMessageFromDevice(
         activeDeviceId,
         peerDeviceId,
@@ -227,13 +185,8 @@ export default function App() {
         media
       );
       setForceUpdate((prev) => prev + 1);
-
-      // Auto-trigger peer response simulation after 700ms so chat feels responsive & alive
-      setTimeout(() => {
-        handleTriggerSimulatePeer(peerDeviceId);
-      }, 700);
     },
-    [activeDeviceId, peerDeviceId, handleTriggerSimulatePeer]
+    [activeDeviceId, peerDeviceId]
   );
 
   const handleLockApp = useCallback(() => {
@@ -264,15 +217,18 @@ export default function App() {
     setForceUpdate((prev) => prev + 1);
   }, []);
 
-  const handleAuthSuccess = useCallback((newAcc: UserAccount) => {
+  const handleAuthSuccess = useCallback(async (newAcc: UserAccount) => {
     setAccount({ ...newAcc });
     setShowAuthModal(false);
     setIsLocked(false);
-    identityManager.syncUserProfile({
-      userId: newAcc.id,
-      fullName: newAcc.fullName,
-      avatarUrl: newAcc.avatarUrl,
-    });
+    setActiveDeviceId(newAcc.activeDeviceId);
+    await identityManager.initForUser(newAcc);
+    const peers = identityManager.getNetworkUsers().filter((u) => u.userId !== newAcc.id);
+    if (peers.length > 0) {
+      setPeerDeviceId(peers[0].primaryDeviceId);
+    } else {
+      setPeerDeviceId('');
+    }
     setForceUpdate((prev) => prev + 1);
   }, []);
 
@@ -405,7 +361,6 @@ export default function App() {
               identityManager.clearTamperAlerts();
               setForceUpdate((prev) => prev + 1);
             }}
-            onTriggerSimulatePeer={handleTriggerSimulatePeer}
           />
         </div>
 
