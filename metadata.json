@@ -1,0 +1,6 @@
+{
+  "name": "NEXUS Zero-Knowledge Platform",
+  "description": "Zero-Knowledge end-to-end encrypted community and messaging platform powered by X3DH, Double Ratchet, content-addressed storage, and tamper-evident Merkle chains.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
